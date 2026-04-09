@@ -18,7 +18,6 @@ from review_loop.models import (
     ReviewerFeedback,
     ReviewIssue,
     ReviewResult,
-    RoundRecord,
 )
 from review_loop.persistence import Archiver
 from review_loop.registry import import_from_path
@@ -293,7 +292,7 @@ class ReviewEngine:
             ctx = await self._context_mgr.build_initial_context()
         self._archiver.save_context(ctx)
 
-        history: list[RoundRecord] = []
+        rounds_completed: int = 0
         per_reviewer_ctx: dict[str, str] = {}
 
         try:
@@ -338,14 +337,7 @@ class ReviewEngine:
                     },
                 )
 
-                # Build round record
-                record = RoundRecord(
-                    round_num=round_num,
-                    author_content=content,
-                    reviewer_feedbacks=feedbacks,
-                    author_response=author_response,
-                )
-                history.append(record)
+                rounds_completed = round_num
 
                 # Update content and prepare next round
                 content = author_response.updated_content
@@ -376,7 +368,7 @@ class ReviewEngine:
             self._archiver.save_error_log(str(exc))
             return ReviewResult(
                 converged=False,
-                rounds_completed=len(history),
+                rounds_completed=rounds_completed,
                 archive_path=session_path,
                 final_content=None,
                 unresolved_issues=[],
