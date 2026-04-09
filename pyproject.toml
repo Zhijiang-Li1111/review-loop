@@ -1,0 +1,25 @@
+[project]
+name = "review-loop"
+version = "0.1.0"
+description = "Generic write-review loop framework for iterative content refinement"
+requires-python = ">=3.12"
+dependencies = [
+    "agno",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[tool.setuptools.packages.find]
+include = ["review_loop*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

@@ -90,8 +90,7 @@ discuss-agent (已有)          review-loop (新建)
 
 ```yaml
 review:
-  min_rounds: 1
-  max_rounds: 3
+  max_rounds: 10
   model: "claude-opus-4.6-1m"
   api_key: "Powered by Agent Maestro"
   base_url: "http://localhost:23333/api/anthropic"
