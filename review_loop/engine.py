@@ -51,7 +51,12 @@ _SUBMIT_REVIEW_INSTRUCTION = (
 # ensuring the Author calls submit_verdict with per-issue verdicts.
 _SUBMIT_VERDICT_INSTRUCTION = (
     "\n\nAfter evaluating each reviewer issue, call submit_verdict to submit your verdicts. "
-    "This tool is only for verdicts — revised content goes in a separate submit_revision call."
+    "This tool is only for verdicts — revised content goes in a separate submit_revision call. "
+    "The verdict and revision steps are two separate calls with no shared memory, "
+    "so the reason field is the only information the revision step will see. "
+    "For each accepted issue, describe the planned change in enough detail "
+    "that a separate agent could execute it (what to change, where, and how). "
+    "For each rejected issue, cite specific evidence from the content."
 )
 
 # Instruction appended to the Author's prompt when applying changes,
