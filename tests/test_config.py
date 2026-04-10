@@ -248,3 +248,17 @@ class TestConfigLoaderModelFields:
         assert cfg.model_config.api_key == "sk-resolved"
         assert cfg.model_config.temperature == 0.7
         assert cfg.model_config.max_tokens == 4096
+
+
+class TestAuthorInitialPrompt:
+    def test_default_initial_prompt(self, sample_config_yaml):
+        cfg = ConfigLoader.load(sample_config_yaml)
+        assert cfg.author.initial_prompt == "请基于上述背景资料，生成初始内容。"
+
+    def test_custom_initial_prompt(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["author"]["initial_prompt"] = "请基于以上选题讨论结论，生成一份完整的文章大纲。"
+        path = tmp_path / "custom_prompt.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.author.initial_prompt == "请基于以上选题讨论结论，生成一份完整的文章大纲。"

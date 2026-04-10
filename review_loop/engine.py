@@ -372,7 +372,7 @@ class ReviewEngine:
     async def _author_generate(self, context: str) -> str:
         prompt = (
             f"{context}\n\n"
-            f"请基于上述背景资料，生成初始内容。"
+            f"{self._config.author.initial_prompt}"
         )
         content = await self._safe_agent_call(self._author_revision, prompt)
         if content is None:

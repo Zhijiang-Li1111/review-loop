@@ -64,11 +64,15 @@ class ToolConfig:
     path: str
 
 
+_DEFAULT_INITIAL_PROMPT = "请基于上述背景资料，生成初始内容。"
+
+
 @dataclass
 class AuthorConfig:
     name: str
     system_prompt: str
     receiving_review_prompt: str
+    initial_prompt: str = _DEFAULT_INITIAL_PROMPT
 
 
 @dataclass
@@ -127,6 +131,7 @@ class ConfigLoader:
             name=author_raw["name"],
             system_prompt=author_raw["system_prompt"],
             receiving_review_prompt=author_raw.get("receiving_review_prompt", ""),
+            initial_prompt=author_raw.get("initial_prompt", _DEFAULT_INITIAL_PROMPT),
         )
 
         # --- reviewers ---
