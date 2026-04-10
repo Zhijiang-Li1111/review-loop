@@ -7,6 +7,9 @@ import json
 import logging
 import re
 from dataclasses import asdict
+from typing import Optional
+
+from pydantic import BaseModel, Field
 
 from agno.agent import Agent
 
@@ -21,6 +24,17 @@ from review_loop.models import (
 )
 from review_loop.persistence import Archiver
 from review_loop.registry import import_from_path
+
+
+class ReviewIssueOutput(BaseModel):
+    """Structured output model for a single review issue."""
+    severity: str = Field(description="Issue severity: critical, major, or minor")
+    content: str = Field(description="Description of the issue found")
+
+
+class ReviewerOutput(BaseModel):
+    """Structured output model for reviewer feedback."""
+    issues: list[ReviewIssueOutput] = Field(default_factory=list, description="List of issues found. Empty list means no issues.")
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +75,30 @@ class ReviewEngine:
             add_history_to_context=False,
         )
 
-        # Create Reviewer agents (no tools)
+        # Expand template variables in reviewer system prompts
+        template_vars = {
+            "{{author.system_prompt}}": config.author.system_prompt,
+        }
+        for rc in config.reviewers:
+            for placeholder, value in template_vars.items():
+                if placeholder in rc.system_prompt:
+                    rc.system_prompt = rc.system_prompt.replace(placeholder, value)
+
+        # Create Reviewer agents (with optional per-reviewer tools)
         self._reviewers: list[Agent] = []
         for rc in config.reviewers:
+            reviewer_tools = None
+            if rc.tools:
+                reviewer_tools = []
+                for tc in rc.tools:
+                    tool_cls = import_from_path(tc.path)
+                    reviewer_tools.append(tool_cls(context=config.context))
             reviewer = Agent(
                 name=rc.name,
                 model=model,
                 system_message=rc.system_prompt,
+                tools=reviewer_tools if reviewer_tools else None,
+                output_schema=ReviewerOutput,
                 store_tool_messages=False,
                 add_history_to_context=False,
             )
@@ -125,24 +156,20 @@ class ReviewEngine:
                     f"{prev_ctx}\n\n"
                     f"以下是修改后的内容：\n\n{content}\n\n"
                     f"请审核修改后的内容。对于 Author 接受并修改的 issue，检查修改是否真正解决了问题。"
-                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。\n\n"
-                    f"请返回 JSON 格式：\n"
-                    f'{{"issues": [{{"severity": "critical|major|minor", "content": "问题描述"}}]}}\n'
-                    f"如果没有问题，返回 {{\"issues\": []}}"
+                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。"
                 )
             else:
                 prompt = (
                     f"以下是需要审核的内容：\n\n{content}\n\n"
-                    f"请仔细审核上述内容，找出其中的问题。\n\n"
-                    f"请返回 JSON 格式：\n"
-                    f'{{"issues": [{{"severity": "critical|major|minor", "content": "问题描述"}}]}}\n'
-                    f"如果没有问题，返回 {{\"issues\": []}}"
+                    f"请仔细审核上述内容，找出其中的问题。"
                 )
 
             raw = await self._safe_agent_call(reviewer, prompt)
             if raw is None:
                 return None
 
+            # With output_model, raw might be a ReviewerOutput pydantic object serialized to string
+            # Try to parse as structured output first
             return self._parse_reviewer_output(reviewer.name, raw)
 
         results = await asyncio.gather(*[call_reviewer(r) for r in self._reviewers])
@@ -153,14 +180,34 @@ class ReviewEngine:
 
         return feedbacks
 
-    def _parse_reviewer_output(self, name: str, raw: str) -> ReviewerFeedback:
-        """Parse reviewer JSON output into ReviewerFeedback."""
+    def _parse_reviewer_output(self, name: str, raw) -> ReviewerFeedback:
+        """Parse reviewer output into ReviewerFeedback.
+        
+        Handles both structured output (ReviewerOutput pydantic object) and
+        plain text/JSON string fallback.
+        """
+        # Handle structured output (Pydantic model from output_model)
+        if isinstance(raw, ReviewerOutput):
+            issues = [
+                ReviewIssue(severity=i.severity, content=i.content)
+                for i in raw.issues
+            ]
+            return ReviewerFeedback(reviewer_name=name, issues=issues)
+
+        # Fallback: parse as string
+        raw = str(raw)
         try:
-            match = re.search(r"\{[^{}]*\"issues\"\s*:\s*\[.*?\]\s*\}", raw, re.DOTALL)
+            # Try to find JSON with "issues" key - use greedy match to handle nested braces
+            match = re.search(r'\{[^{]*"issues"\s*:\s*\[.*\]\s*\}', raw, re.DOTALL)
             if match:
                 data = json.loads(match.group())
             else:
-                data = json.loads(raw)
+                # Try extracting from markdown code block
+                code_match = re.search(r'```(?:json)?\s*(\{.*?"issues".*?\})\s*```', raw, re.DOTALL)
+                if code_match:
+                    data = json.loads(code_match.group(1))
+                else:
+                    data = json.loads(raw)
         except (json.JSONDecodeError, AttributeError):
             logger.warning("Reviewer '%s' returned non-JSON output, treating as no issues", name)
             return ReviewerFeedback(reviewer_name=name, issues=[])

@@ -75,6 +75,7 @@ class AuthorConfig:
 class ReviewerConfig:
     name: str
     system_prompt: str
+    tools: list[ToolConfig] | None = None
 
 
 @dataclass
@@ -131,8 +132,23 @@ class ConfigLoader:
         # --- reviewers ---
         reviewers = []
         for r in raw["reviewers"]:
+            reviewer_tools: list[ToolConfig] | None = None
+            raw_reviewer_tools = r.get("tools")
+            if raw_reviewer_tools:
+                reviewer_tools = []
+                for j, rt in enumerate(raw_reviewer_tools):
+                    if not isinstance(rt, dict) or "path" not in rt:
+                        raise ValueError(
+                            f"reviewers['{r.get('name', '?')}'].tools[{j}]: "
+                            f"each tool must be a dict with a 'path' key, got {rt!r}"
+                        )
+                    reviewer_tools.append(ToolConfig(path=rt["path"]))
             reviewers.append(
-                ReviewerConfig(name=r["name"], system_prompt=r["system_prompt"])
+                ReviewerConfig(
+                    name=r["name"],
+                    system_prompt=r["system_prompt"],
+                    tools=reviewer_tools,
+                )
             )
         if not reviewers:
             raise ValueError("'reviewers' list must not be empty")

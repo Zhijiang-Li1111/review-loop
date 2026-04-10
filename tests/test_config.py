@@ -170,6 +170,30 @@ class TestConfigLoaderOptionalFields:
         cfg = ConfigLoader.load(str(path))
         assert cfg.context_builder == "my_pkg.context.build"
 
+    def test_reviewer_tools_parsed(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "Check.", "tools": [{"path": "pkg.SearchTools"}]},
+            {"name": "R2", "system_prompt": "Review."},
+        ]
+        path = tmp_path / "rt.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.reviewers[0].tools is not None
+        assert len(cfg.reviewers[0].tools) == 1
+        assert cfg.reviewers[0].tools[0].path == "pkg.SearchTools"
+        assert cfg.reviewers[1].tools is None
+
+    def test_reviewer_tool_missing_path_raises(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "Check.", "tools": [{"name": "bad"}]},
+        ]
+        path = tmp_path / "bad_rt.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        with pytest.raises(ValueError, match="path"):
+            ConfigLoader.load(str(path))
+
 
 class TestResolveEnv:
     def test_env_prefix_resolves(self, monkeypatch):

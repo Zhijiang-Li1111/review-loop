@@ -72,6 +72,23 @@ class TestAgentCreation:
         reviewer_names = [c.kwargs["name"] for c in calls[1:]]
         assert reviewer_names == ["Reviewer-A", "Reviewer-B", "Reviewer-C"]
 
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_reviewers_created_with_output_schema(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine, ReviewerOutput
+
+        config = _make_config(num_reviewers=2)
+        engine = ReviewEngine(config)
+
+        # Author (first call) should NOT have output_schema
+        author_call = MockAgent.call_args_list[0]
+        assert "output_schema" not in author_call.kwargs
+
+        # Reviewers should have output_schema=ReviewerOutput
+        for call in MockAgent.call_args_list[1:]:
+            assert call.kwargs["output_schema"] is ReviewerOutput
+
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
     def test_author_gets_tools(self, MockAgent, MockCtxMgr):
@@ -91,7 +108,7 @@ class TestAgentCreation:
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewers_have_no_tools(self, MockAgent, MockCtxMgr):
+    def test_reviewers_have_no_tools_by_default(self, MockAgent, MockCtxMgr):
         from review_loop.engine import ReviewEngine
 
         class FakeTool:
@@ -105,6 +122,66 @@ class TestAgentCreation:
         for call in MockAgent.call_args_list[1:]:
             tools_arg = call.kwargs.get("tools")
             assert tools_arg is None
+
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_reviewer_gets_tools_when_configured(self, MockAgent, MockCtxMgr):
+        from review_loop.engine import ReviewEngine
+
+        class FakeAuthorTool:
+            def __init__(self, context=None):
+                self.tag = "author"
+
+        class FakeReviewerTool:
+            def __init__(self, context=None):
+                self.tag = "reviewer"
+
+        def fake_import(path):
+            if path == "pkg.AuthorTool":
+                return FakeAuthorTool
+            return FakeReviewerTool
+
+        reviewers = [
+            ReviewerConfig(
+                name="Reviewer-A",
+                system_prompt="You are reviewer A.",
+                tools=[ToolConfig(path="pkg.ReviewerTool")],
+            ),
+            ReviewerConfig(
+                name="Reviewer-B",
+                system_prompt="You are reviewer B.",
+            ),
+        ]
+        config = ReviewConfig(
+            max_rounds=3,
+            model_config=ModelConfig(model="claude-opus-4.6-1m"),
+            author=AuthorConfig(
+                name="Author",
+                system_prompt="You are an author.",
+                receiving_review_prompt="Process feedback.",
+            ),
+            reviewers=reviewers,
+            tools=[ToolConfig(path="pkg.AuthorTool")],
+            context={},
+        )
+
+        with patch("review_loop.engine.import_from_path", side_effect=fake_import):
+            engine = ReviewEngine(config)
+
+        # Agent calls: Author, Reviewer-A, Reviewer-B
+        assert MockAgent.call_count == 3
+
+        # Reviewer-A should have tools
+        reviewer_a_call = MockAgent.call_args_list[1]
+        assert reviewer_a_call.kwargs["name"] == "Reviewer-A"
+        assert reviewer_a_call.kwargs["tools"] is not None
+        assert len(reviewer_a_call.kwargs["tools"]) == 1
+        assert reviewer_a_call.kwargs["tools"][0].tag == "reviewer"
+
+        # Reviewer-B should have no tools
+        reviewer_b_call = MockAgent.call_args_list[2]
+        assert reviewer_b_call.kwargs["name"] == "Reviewer-B"
+        assert reviewer_b_call.kwargs["tools"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -704,3 +781,164 @@ class TestParsing:
         fb = engine._parse_reviewer_output("R1", raw)
         assert len(fb.issues) == 1
         assert fb.issues[0].severity == "minor"
+
+
+# ---------------------------------------------------------------------------
+# Structured Output (Pydantic model from output_schema)
+# ---------------------------------------------------------------------------
+
+
+class TestStructuredOutput:
+    """Tests for ReviewerOutput (Pydantic model) handling via output_schema."""
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_parse_reviewer_output_pydantic_instance(self, MockAgent, MockCtxMgr, mock_import):
+        """When output_schema works, raw is a ReviewerOutput Pydantic model."""
+        from review_loop.engine import ReviewEngine, ReviewerOutput, ReviewIssueOutput
+
+        config = _make_config()
+        engine = ReviewEngine(config)
+
+        pydantic_output = ReviewerOutput(issues=[
+            ReviewIssueOutput(severity="critical", content="Missing validation"),
+            ReviewIssueOutput(severity="minor", content="Style issue"),
+        ])
+        fb = engine._parse_reviewer_output("R1", pydantic_output)
+        assert len(fb.issues) == 2
+        assert fb.issues[0].severity == "critical"
+        assert fb.issues[0].content == "Missing validation"
+        assert fb.issues[1].severity == "minor"
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_parse_reviewer_output_pydantic_empty_issues(self, MockAgent, MockCtxMgr, mock_import):
+        """Pydantic model with no issues -> empty issues list."""
+        from review_loop.engine import ReviewEngine, ReviewerOutput
+
+        config = _make_config()
+        engine = ReviewEngine(config)
+
+        pydantic_output = ReviewerOutput(issues=[])
+        fb = engine._parse_reviewer_output("R1", pydantic_output)
+        assert fb.issues == []
+        assert fb.reviewer_name == "R1"
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @pytest.mark.asyncio
+    async def test_review_with_structured_output(self, MockCtxMgr, mock_import):
+        """End-to-end: reviewer returns ReviewerOutput Pydantic instance."""
+        from review_loop.engine import ReviewEngine, ReviewerOutput, ReviewIssueOutput
+
+        mock_reviewers = [MagicMock(), MagicMock()]
+        mock_reviewers[0].name = "Reviewer-A"
+        mock_reviewers[1].name = "Reviewer-B"
+        mock_author = MagicMock(name="Author")
+        mock_author.name = "Author"
+
+        with patch("review_loop.engine.Agent", side_effect=[mock_author] + mock_reviewers):
+            config = _make_config(num_reviewers=2)
+            engine = ReviewEngine(config)
+
+        # Simulate output_schema working: _safe_agent_call returns Pydantic model
+        pydantic_a = ReviewerOutput(issues=[
+            ReviewIssueOutput(severity="critical", content="Logic gap"),
+        ])
+        pydantic_b = ReviewerOutput(issues=[])
+
+        async def mock_safe_call(agent, prompt):
+            if agent.name == "Reviewer-A":
+                return pydantic_a
+            return pydantic_b
+
+        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+            feedbacks = await engine._review("Content v1", {})
+
+        assert len(feedbacks) == 2
+        fb_a = next(f for f in feedbacks if f.reviewer_name == "Reviewer-A")
+        fb_b = next(f for f in feedbacks if f.reviewer_name == "Reviewer-B")
+        assert len(fb_a.issues) == 1
+        assert fb_a.issues[0].severity == "critical"
+        assert fb_a.issues[0].content == "Logic gap"
+        assert len(fb_b.issues) == 0
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_parse_reviewer_output_fallback_string(self, MockAgent, MockCtxMgr, mock_import):
+        """When output_schema fails (model returns string), fallback JSON parsing works."""
+        from review_loop.engine import ReviewEngine
+
+        config = _make_config()
+        engine = ReviewEngine(config)
+
+        # String fallback still works
+        raw = '{"issues": [{"severity": "major", "content": "Bad logic"}]}'
+        fb = engine._parse_reviewer_output("R1", raw)
+        assert len(fb.issues) == 1
+        assert fb.issues[0].severity == "major"
+
+
+class TestReviewerPromptTemplateExpansion:
+    """Template variables in reviewer system_prompt get expanded at init."""
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_author_system_prompt_injected_into_reviewer(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+
+        config = ReviewConfig(
+            max_rounds=3,
+            model_config=ModelConfig(model="claude-opus-4.6-1m"),
+            author=AuthorConfig(
+                name="Author",
+                system_prompt="Author rules: write hooks, use frameworks.",
+                receiving_review_prompt="Process feedback.",
+            ),
+            reviewers=[
+                ReviewerConfig(
+                    name="Checker",
+                    system_prompt="Check against: {{author.system_prompt}}",
+                ),
+                ReviewerConfig(
+                    name="Editor",
+                    system_prompt="You are an editor.",
+                ),
+            ],
+            tools=[],
+            context={},
+        )
+        ReviewEngine(config)
+
+        # Agent is called 3 times: 1 author + 2 reviewers
+        assert MockAgent.call_count == 3
+
+        # The Checker reviewer should have the author prompt expanded
+        checker_call = MockAgent.call_args_list[1]
+        assert checker_call.kwargs["name"] == "Checker"
+        assert "Author rules: write hooks, use frameworks." in checker_call.kwargs["system_message"]
+        assert "{{author.system_prompt}}" not in checker_call.kwargs["system_message"]
+
+        # The Editor reviewer should be unchanged
+        editor_call = MockAgent.call_args_list[2]
+        assert editor_call.kwargs["name"] == "Editor"
+        assert editor_call.kwargs["system_message"] == "You are an editor."
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_no_template_variable_leaves_prompt_unchanged(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+
+        config = _make_config(num_reviewers=2)
+        ReviewEngine(config)
+
+        # Default reviewers have no template variables — prompts should be untouched
+        reviewer_a_call = MockAgent.call_args_list[1]
+        assert reviewer_a_call.kwargs["system_message"] == "You are reviewer A."
+        reviewer_b_call = MockAgent.call_args_list[2]
+        assert reviewer_b_call.kwargs["system_message"] == "You are reviewer B."
