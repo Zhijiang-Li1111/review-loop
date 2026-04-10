@@ -43,43 +43,22 @@ logger = logging.getLogger(__name__)
 # Instruction appended to every reviewer's system prompt to ensure
 # they call the submit_review tool with structured output.
 _SUBMIT_REVIEW_INSTRUCTION = (
-    "\n\n[IMPORTANT] After completing your review, you MUST call the "
-    "`submit_review` tool to submit your findings. Pass a JSON array of "
-    "issue objects as the `issues` argument. Each issue object must have "
-    '"severity" (one of "critical", "major", "minor", "suggestion") and '
-    '"content" (description of the issue). If you found no issues, pass "[]".'
-    "\n\nExample tool call:\n"
-    'submit_review(issues=\'[{"severity": "critical", "content": "Missing validation for edge case X"}]\')'
+    "\n\nAfter completing your review, call submit_review to submit your findings. "
+    "Pass an empty array if no issues were found."
 )
 
 # Instruction appended to the Author's prompt when evaluating feedback,
 # ensuring the Author calls submit_verdict with per-issue verdicts.
 _SUBMIT_VERDICT_INSTRUCTION = (
-    "\n\n[IMPORTANT] After evaluating each reviewer issue, you MUST call the "
-    "`submit_verdict` tool to submit your verdicts. This tool takes one argument:\n"
-    "`verdicts`: a JSON array where each object has "
-    '"reviewer" (name), "issue_index" (0-based int), '
-    '"verdict" ("accept", "reject", or "unclear"), and "reason" (brief explanation).\n\n'
-    "Do NOT include updated content — only submit verdicts.\n\n"
-    "Example:\n"
-    "submit_verdict(\n"
-    '  verdicts=\'[{"reviewer": "审核员A", "issue_index": 0, '
-    '"verdict": "accept", "reason": "已修正"}]\'\n'
-    ")"
+    "\n\nAfter evaluating each reviewer issue, call submit_verdict to submit your verdicts. "
+    "This tool is only for verdicts — revised content goes in a separate submit_revision call."
 )
 
 # Instruction appended to the Author's prompt when applying changes,
 # ensuring the Author calls submit_revision with the complete revised content.
 _SUBMIT_REVISION_INSTRUCTION = (
-    "\n\n[IMPORTANT] After applying changes, you MUST call the "
-    "`submit_revision` tool to submit the revised content. This tool takes one argument:\n"
-    "`updated_content`: the COMPLETE revised content. Paste the entire document "
-    "here — do not write placeholders like '见下方' or '完整内容如下'. "
-    "This exact string replaces the previous version.\n\n"
-    "Example:\n"
-    "submit_revision(\n"
-    "  updated_content='# 完整修改后的内容...（全文）'\n"
-    ")"
+    "\n\nAfter applying changes, call submit_revision with the complete revised content. "
+    "This exact string replaces the previous version."
 )
 
 

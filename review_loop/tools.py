@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 def submit_review(issues: str) -> str:
     """Submit the final review result with a list of issues found.
 
-    This tool MUST be called as the final action after completing your review.
-    All review findings must be submitted through this tool — do not write
-    issues in your text response; they will be ignored.
+    Call this tool as the final action after completing your review.
+    All review findings go through this tool — issues in your text response
+    will be ignored.
 
     Args:
         issues: A JSON array of issue objects. Each object must have:
@@ -58,9 +58,9 @@ def submit_review(issues: str) -> str:
 def submit_verdict(verdicts: str) -> str:
     """Submit verdicts on each reviewer issue without revising content.
 
-    This tool MUST be called as the final action after evaluating reviewer
-    feedback.  Only submit your verdict for each issue here — do NOT include
-    updated content.  A separate revision step will follow.
+    Call this tool as the final action after evaluating reviewer feedback.
+    This tool is only for verdicts. Revised content goes in a separate
+    submit_revision call.
 
     Args:
         verdicts: A JSON array of verdict objects. Each object must have:
@@ -108,7 +108,7 @@ def submit_verdict(verdicts: str) -> str:
 def submit_revision(updated_content: str) -> str:
     """Submit the full revised content after incorporating accepted feedback.
 
-    This tool MUST be called as the final action after applying changes.
+    Call this tool as the final action after applying changes.
     The updated_content parameter must contain the COMPLETE revised content — not a
     summary, pointer, or reference like "见下方". The engine reads updated_content
     directly and passes it to the next review round; anything omitted is lost.

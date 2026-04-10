@@ -148,7 +148,7 @@ class TestAgentCreation:
         reviewer_call = MockAgent.call_args_list[2]
         system_msg = reviewer_call.kwargs["system_message"]
         assert "submit_review" in system_msg
-        assert "MUST call" in system_msg
+        assert "call submit_review" in system_msg
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
@@ -640,7 +640,7 @@ class TestAuthorFeedback:
             await engine._author_evaluate_feedback("v1", feedbacks)
 
         assert "Process feedback carefully." in captured_prompts[0]
-        assert "submit_verdict" in captured_prompts[0]
+        assert "call submit_verdict" in captured_prompts[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1729,8 +1729,7 @@ class TestAuthorToolCallIntegration:
             await engine._author_evaluate_feedback("v1", feedbacks)
 
         assert len(captured_prompts) == 1
-        assert "submit_verdict" in captured_prompts[0]
-        assert "MUST call" in captured_prompts[0]
+        assert "call submit_verdict" in captured_prompts[0]
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
@@ -1772,5 +1771,4 @@ class TestAuthorToolCallIntegration:
             await engine._author_apply_changes("v1", verdicts, feedbacks)
 
         assert len(captured_prompts) == 1
-        assert "submit_revision" in captured_prompts[0]
-        assert "MUST call" in captured_prompts[0]
+        assert "call submit_revision" in captured_prompts[0]
