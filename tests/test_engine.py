@@ -17,8 +17,38 @@ from review_loop.config import (
 
 
 class MockRunOutput:
-    def __init__(self, content: str | None):
+    """Simulates agno RunOutput with content, tools, and messages."""
+    def __init__(self, content: str | None = None, tools=None, messages=None):
         self.content = content
+        self.tools = tools or []
+        self.messages = messages or []
+
+
+class MockToolExecution:
+    """Simulates agno ToolExecution."""
+    def __init__(self, tool_name: str, tool_args: dict | None = None, result: str | None = None):
+        self.tool_name = tool_name
+        self.tool_args = tool_args
+        self.result = result
+        self.tool_call_id = None
+        self.tool_call_error = None
+
+
+class MockMessage:
+    """Simulates agno Message with tool call fields."""
+    def __init__(
+        self,
+        role: str = "assistant",
+        content: str | None = None,
+        tool_name: str | None = None,
+        tool_args=None,
+        tool_calls=None,
+    ):
+        self.role = role
+        self.content = content
+        self.tool_name = tool_name
+        self.tool_args = tool_args
+        self.tool_calls = tool_calls
 
 
 def _make_config(
@@ -75,19 +105,39 @@ class TestAgentCreation:
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewers_created_with_output_schema(self, MockAgent, MockCtxMgr, mock_import):
-        from review_loop.engine import ReviewEngine, ReviewerOutput
+    def test_reviewers_have_submit_review_tool(self, MockAgent, MockCtxMgr, mock_import):
+        """Reviewers should get submit_review as a tool (not output_schema)."""
+        from review_loop.engine import ReviewEngine
+        from review_loop.tools import submit_review
 
         config = _make_config(num_reviewers=2)
         engine = ReviewEngine(config)
 
-        # Author (first call) should NOT have output_schema
+        # Author (first call) should NOT have submit_review
         author_call = MockAgent.call_args_list[0]
         assert "output_schema" not in author_call.kwargs
 
-        # Reviewers should have output_schema=ReviewerOutput
+        # Reviewers should NOT have output_schema
         for call in MockAgent.call_args_list[1:]:
-            assert call.kwargs["output_schema"] is ReviewerOutput
+            assert "output_schema" not in call.kwargs
+            # Should have submit_review in tools
+            tools = call.kwargs.get("tools", [])
+            assert submit_review in tools
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_reviewer_system_prompt_has_submit_instruction(self, MockAgent, MockCtxMgr, mock_import):
+        """Reviewer system prompt should include submit_review instruction."""
+        from review_loop.engine import ReviewEngine
+
+        config = _make_config(num_reviewers=1)
+        engine = ReviewEngine(config)
+
+        reviewer_call = MockAgent.call_args_list[1]
+        system_msg = reviewer_call.kwargs["system_message"]
+        assert "submit_review" in system_msg
+        assert "MUST call" in system_msg
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
@@ -108,8 +158,10 @@ class TestAgentCreation:
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewers_have_no_tools_by_default(self, MockAgent, MockCtxMgr):
+    def test_reviewers_get_submit_review_even_without_per_reviewer_tools(self, MockAgent, MockCtxMgr):
+        """Reviewers always get submit_review, even when no per-reviewer tools are configured."""
         from review_loop.engine import ReviewEngine
+        from review_loop.tools import submit_review
 
         class FakeTool:
             def __init__(self, context=None):
@@ -121,12 +173,15 @@ class TestAgentCreation:
 
         for call in MockAgent.call_args_list[1:]:
             tools_arg = call.kwargs.get("tools")
-            assert tools_arg is None
+            assert tools_arg is not None
+            assert submit_review in tools_arg
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewer_gets_tools_when_configured(self, MockAgent, MockCtxMgr):
+    def test_reviewer_gets_per_reviewer_tools_plus_submit_review(self, MockAgent, MockCtxMgr):
+        """Per-reviewer tools coexist with submit_review."""
         from review_loop.engine import ReviewEngine
+        from review_loop.tools import submit_review
 
         class FakeAuthorTool:
             def __init__(self, context=None):
@@ -171,17 +226,151 @@ class TestAgentCreation:
         # Agent calls: Author, Reviewer-A, Reviewer-B
         assert MockAgent.call_count == 3
 
-        # Reviewer-A should have tools
+        # Reviewer-A should have submit_review + per-reviewer tool
         reviewer_a_call = MockAgent.call_args_list[1]
         assert reviewer_a_call.kwargs["name"] == "Reviewer-A"
-        assert reviewer_a_call.kwargs["tools"] is not None
-        assert len(reviewer_a_call.kwargs["tools"]) == 1
-        assert reviewer_a_call.kwargs["tools"][0].tag == "reviewer"
+        tools_a = reviewer_a_call.kwargs["tools"]
+        assert tools_a is not None
+        assert submit_review in tools_a
+        assert len(tools_a) == 2  # submit_review + FakeReviewerTool
+        # Check that per-reviewer tool is also there
+        per_reviewer_tools = [t for t in tools_a if t is not submit_review]
+        assert len(per_reviewer_tools) == 1
+        assert per_reviewer_tools[0].tag == "reviewer"
 
-        # Reviewer-B should have no tools
+        # Reviewer-B should have only submit_review
         reviewer_b_call = MockAgent.call_args_list[2]
         assert reviewer_b_call.kwargs["name"] == "Reviewer-B"
-        assert reviewer_b_call.kwargs["tools"] is None
+        tools_b = reviewer_b_call.kwargs["tools"]
+        assert tools_b is not None
+        assert submit_review in tools_b
+        assert len(tools_b) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tool Call Extraction
+# ---------------------------------------------------------------------------
+
+
+class TestToolCallExtraction:
+    """Tests for _extract_tool_call_issues static method."""
+
+    def test_extract_from_tool_execution(self):
+        """Extract issues from RunOutput.tools (ToolExecution objects)."""
+        from review_loop.engine import ReviewEngine
+
+        issues_json = json.dumps([
+            {"severity": "critical", "content": "Missing validation"},
+            {"severity": "minor", "content": "Style issue"},
+        ])
+        run_output = MockRunOutput(
+            tools=[MockToolExecution(
+                tool_name="submit_review",
+                tool_args={"issues": issues_json},
+            )]
+        )
+
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert len(result) == 2
+        assert result[0]["severity"] == "critical"
+        assert result[1]["content"] == "Style issue"
+
+    def test_extract_empty_issues_from_tool_execution(self):
+        """Empty issues list from tool call."""
+        from review_loop.engine import ReviewEngine
+
+        run_output = MockRunOutput(
+            tools=[MockToolExecution(
+                tool_name="submit_review",
+                tool_args={"issues": "[]"},
+            )]
+        )
+
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert result == []
+
+    def test_extract_from_message_tool_name(self):
+        """Extract from message where tool_name=submit_review and tool_args is set."""
+        from review_loop.engine import ReviewEngine
+
+        issues_json = json.dumps([{"severity": "major", "content": "Bad logic"}])
+        run_output = MockRunOutput(
+            messages=[MockMessage(
+                role="tool",
+                tool_name="submit_review",
+                tool_args={"issues": issues_json},
+            )]
+        )
+
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["severity"] == "major"
+
+    def test_extract_from_message_tool_calls(self):
+        """Extract from assistant message with tool_calls list."""
+        from review_loop.engine import ReviewEngine
+
+        issues_data = [{"severity": "minor", "content": "Typo"}]
+        args = json.dumps({"issues": json.dumps(issues_data)})
+        run_output = MockRunOutput(
+            messages=[MockMessage(
+                role="assistant",
+                tool_calls=[{
+                    "function": {
+                        "name": "submit_review",
+                        "arguments": args,
+                    }
+                }],
+            )]
+        )
+
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["content"] == "Typo"
+
+    def test_no_submit_review_returns_none(self):
+        """No submit_review tool call -> returns None."""
+        from review_loop.engine import ReviewEngine
+
+        run_output = MockRunOutput(
+            content="Just some text",
+            tools=[MockToolExecution(
+                tool_name="search_research",
+                tool_args={"query": "something"},
+            )],
+        )
+
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is None
+
+    def test_empty_run_output_returns_none(self):
+        """Empty RunOutput -> returns None."""
+        from review_loop.engine import ReviewEngine
+
+        run_output = MockRunOutput()
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is None
+
+    def test_ignores_other_tools(self):
+        """Only extracts from submit_review, ignores other tool calls."""
+        from review_loop.engine import ReviewEngine
+
+        issues_json = json.dumps([{"severity": "critical", "content": "Issue found"}])
+        run_output = MockRunOutput(
+            tools=[
+                MockToolExecution(tool_name="search_research", tool_args={"query": "foo"}),
+                MockToolExecution(tool_name="submit_review", tool_args={"issues": issues_json}),
+            ]
+        )
+
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["severity"] == "critical"
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +382,8 @@ class TestReviewPhase:
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @pytest.mark.asyncio
-    async def test_reviewers_audit_in_parallel(self, MockCtxMgr, mock_import):
+    async def test_reviewers_audit_in_parallel_via_tool_call(self, MockCtxMgr, mock_import):
+        """Reviewers submit structured output via submit_review tool call."""
         from review_loop.engine import ReviewEngine
 
         mock_reviewers = [MagicMock(), MagicMock()]
@@ -206,15 +396,27 @@ class TestReviewPhase:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        issues_a = json.dumps({"issues": [{"severity": "critical", "content": "Logic gap"}]})
-        issues_b = json.dumps({"issues": []})
+        issues_a = json.dumps([{"severity": "critical", "content": "Logic gap"}])
+        issues_b = json.dumps([])
 
-        async def mock_safe_call(agent, prompt):
+        async def mock_safe_call_full(agent, prompt):
             if agent.name == "Reviewer-A":
-                return issues_a
-            return issues_b
+                return MockRunOutput(
+                    content="Review complete",
+                    tools=[MockToolExecution(
+                        tool_name="submit_review",
+                        tool_args={"issues": issues_a},
+                    )],
+                )
+            return MockRunOutput(
+                content="No issues found",
+                tools=[MockToolExecution(
+                    tool_name="submit_review",
+                    tool_args={"issues": issues_b},
+                )],
+            )
 
-        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
             feedbacks = await engine._review("Content v1", {})
 
         assert len(feedbacks) == 2
@@ -223,6 +425,35 @@ class TestReviewPhase:
         assert len(fb_a.issues) == 1
         assert fb_a.issues[0].severity == "critical"
         assert len(fb_b.issues) == 0
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @pytest.mark.asyncio
+    async def test_review_fallback_to_string_parsing(self, MockCtxMgr, mock_import):
+        """When no tool call present, fall back to string JSON parsing."""
+        from review_loop.engine import ReviewEngine
+
+        mock_reviewers = [MagicMock()]
+        mock_reviewers[0].name = "Reviewer-A"
+        mock_author = MagicMock(name="Author")
+        mock_author.name = "Author"
+
+        with patch("review_loop.engine.Agent", side_effect=[mock_author] + mock_reviewers):
+            config = _make_config(num_reviewers=1)
+            engine = ReviewEngine(config)
+
+        # No tool calls — just content with JSON
+        async def mock_safe_call_full(agent, prompt):
+            return MockRunOutput(
+                content='{"issues": [{"severity": "major", "content": "Bad data"}]}',
+            )
+
+        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
+            feedbacks = await engine._review("Content v1", {})
+
+        assert len(feedbacks) == 1
+        assert len(feedbacks[0].issues) == 1
+        assert feedbacks[0].issues[0].severity == "major"
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
@@ -242,9 +473,14 @@ class TestReviewPhase:
 
         captured_prompts = {}
 
-        async def mock_safe_call(agent, prompt):
+        async def mock_safe_call_full(agent, prompt):
             captured_prompts[agent.name] = prompt
-            return json.dumps({"issues": []})
+            return MockRunOutput(
+                tools=[MockToolExecution(
+                    tool_name="submit_review",
+                    tool_args={"issues": "[]"},
+                )],
+            )
 
         # Build per-reviewer context
         per_reviewer_ctx = {
@@ -252,7 +488,7 @@ class TestReviewPhase:
             "Reviewer-B": "Issue B context only",
         }
 
-        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
             await engine._review("Content v2", per_reviewer_ctx)
 
         assert "Issue A context only" in captured_prompts["Reviewer-A"]
@@ -420,12 +656,17 @@ class TestErrorHandling:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        async def mock_safe_call(agent, prompt):
+        async def mock_safe_call_full(agent, prompt):
             if agent.name == "Reviewer-A":
                 return None  # failure
-            return json.dumps({"issues": []})
+            return MockRunOutput(
+                tools=[MockToolExecution(
+                    tool_name="submit_review",
+                    tool_args={"issues": "[]"},
+                )],
+            )
 
-        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
             feedbacks = await engine._review("Content", {})
 
         assert len(feedbacks) == 1
@@ -447,10 +688,10 @@ class TestErrorHandling:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        async def mock_safe_call(agent, prompt):
+        async def mock_safe_call_full(agent, prompt):
             return None
 
-        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
             with pytest.raises(AllReviewersFailedError):
                 await engine._review("Content", {})
 
@@ -679,7 +920,7 @@ class TestMainLoop:
 
 
 # ---------------------------------------------------------------------------
-# Parsing (LLM output handling)
+# Parsing (LLM output handling - backward compatibility)
 # ---------------------------------------------------------------------------
 
 
@@ -784,18 +1025,18 @@ class TestParsing:
 
 
 # ---------------------------------------------------------------------------
-# Structured Output (Pydantic model from output_schema)
+# Structured Output (Pydantic model from output_schema - backward compat)
 # ---------------------------------------------------------------------------
 
 
 class TestStructuredOutput:
-    """Tests for ReviewerOutput (Pydantic model) handling via output_schema."""
+    """Tests for ReviewerOutput (Pydantic model) handling — kept for backward compat."""
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
     def test_parse_reviewer_output_pydantic_instance(self, MockAgent, MockCtxMgr, mock_import):
-        """When output_schema works, raw is a ReviewerOutput Pydantic model."""
+        """String parsing still handles ReviewerOutput Pydantic models."""
         from review_loop.engine import ReviewEngine, ReviewerOutput, ReviewIssueOutput
 
         config = _make_config()
@@ -825,45 +1066,6 @@ class TestStructuredOutput:
         fb = engine._parse_reviewer_output("R1", pydantic_output)
         assert fb.issues == []
         assert fb.reviewer_name == "R1"
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @pytest.mark.asyncio
-    async def test_review_with_structured_output(self, MockCtxMgr, mock_import):
-        """End-to-end: reviewer returns ReviewerOutput Pydantic instance."""
-        from review_loop.engine import ReviewEngine, ReviewerOutput, ReviewIssueOutput
-
-        mock_reviewers = [MagicMock(), MagicMock()]
-        mock_reviewers[0].name = "Reviewer-A"
-        mock_reviewers[1].name = "Reviewer-B"
-        mock_author = MagicMock(name="Author")
-        mock_author.name = "Author"
-
-        with patch("review_loop.engine.Agent", side_effect=[mock_author] + mock_reviewers):
-            config = _make_config(num_reviewers=2)
-            engine = ReviewEngine(config)
-
-        # Simulate output_schema working: _safe_agent_call returns Pydantic model
-        pydantic_a = ReviewerOutput(issues=[
-            ReviewIssueOutput(severity="critical", content="Logic gap"),
-        ])
-        pydantic_b = ReviewerOutput(issues=[])
-
-        async def mock_safe_call(agent, prompt):
-            if agent.name == "Reviewer-A":
-                return pydantic_a
-            return pydantic_b
-
-        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
-            feedbacks = await engine._review("Content v1", {})
-
-        assert len(feedbacks) == 2
-        fb_a = next(f for f in feedbacks if f.reviewer_name == "Reviewer-A")
-        fb_b = next(f for f in feedbacks if f.reviewer_name == "Reviewer-B")
-        assert len(fb_a.issues) == 1
-        assert fb_a.issues[0].severity == "critical"
-        assert fb_a.issues[0].content == "Logic gap"
-        assert len(fb_b.issues) == 0
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
@@ -918,27 +1120,91 @@ class TestReviewerPromptTemplateExpansion:
         assert MockAgent.call_count == 3
 
         # The Checker reviewer should have the author prompt expanded
+        # (plus submit_review instruction appended)
         checker_call = MockAgent.call_args_list[1]
         assert checker_call.kwargs["name"] == "Checker"
         assert "Author rules: write hooks, use frameworks." in checker_call.kwargs["system_message"]
         assert "{{author.system_prompt}}" not in checker_call.kwargs["system_message"]
 
-        # The Editor reviewer should be unchanged
+        # The Editor reviewer should have base prompt + submit_review instruction
         editor_call = MockAgent.call_args_list[2]
         assert editor_call.kwargs["name"] == "Editor"
-        assert editor_call.kwargs["system_message"] == "You are an editor."
+        assert "You are an editor." in editor_call.kwargs["system_message"]
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_no_template_variable_leaves_prompt_unchanged(self, MockAgent, MockCtxMgr, mock_import):
+    def test_no_template_variable_leaves_prompt_base_unchanged(self, MockAgent, MockCtxMgr, mock_import):
         from review_loop.engine import ReviewEngine
 
         config = _make_config(num_reviewers=2)
         ReviewEngine(config)
 
-        # Default reviewers have no template variables — prompts should be untouched
+        # Default reviewers have no template variables — base prompts should be present
         reviewer_a_call = MockAgent.call_args_list[1]
-        assert reviewer_a_call.kwargs["system_message"] == "You are reviewer A."
+        assert "You are reviewer A." in reviewer_a_call.kwargs["system_message"]
         reviewer_b_call = MockAgent.call_args_list[2]
-        assert reviewer_b_call.kwargs["system_message"] == "You are reviewer B."
+        assert "You are reviewer B." in reviewer_b_call.kwargs["system_message"]
+
+
+# ---------------------------------------------------------------------------
+# submit_review Tool Tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubmitReviewTool:
+    """Tests for the submit_review tool function itself."""
+
+    def test_valid_issues_json(self):
+        from review_loop.tools import submit_review
+
+        result = submit_review('[{"severity": "critical", "content": "Missing validation"}]')
+        parsed = json.loads(result)
+        assert parsed["status"] == "submitted"
+        assert parsed["issue_count"] == 1
+
+    def test_empty_issues(self):
+        from review_loop.tools import submit_review
+
+        result = submit_review("[]")
+        parsed = json.loads(result)
+        assert parsed["status"] == "submitted"
+        assert parsed["issue_count"] == 0
+
+    def test_multiple_issues(self):
+        from review_loop.tools import submit_review
+
+        issues = json.dumps([
+            {"severity": "critical", "content": "Issue 1"},
+            {"severity": "minor", "content": "Issue 2"},
+            {"severity": "major", "content": "Issue 3"},
+        ])
+        result = submit_review(issues)
+        parsed = json.loads(result)
+        assert parsed["issue_count"] == 3
+
+    def test_invalid_json(self):
+        from review_loop.tools import submit_review
+
+        result = submit_review("not json")
+        assert "Error" in result
+
+    def test_non_array_json(self):
+        from review_loop.tools import submit_review
+
+        result = submit_review('{"not": "array"}')
+        assert "Error" in result
+
+    def test_missing_severity(self):
+        from review_loop.tools import submit_review
+
+        result = submit_review('[{"content": "no severity"}]')
+        assert "Error" in result
+        assert "severity" in result
+
+    def test_missing_content(self):
+        from review_loop.tools import submit_review
+
+        result = submit_review('[{"severity": "minor"}]')
+        assert "Error" in result
+        assert "content" in result

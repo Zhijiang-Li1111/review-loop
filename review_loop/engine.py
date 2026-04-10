@@ -24,8 +24,10 @@ from review_loop.models import (
 )
 from review_loop.persistence import Archiver
 from review_loop.registry import import_from_path
+from review_loop.tools import submit_review
 
 
+# Keep these for backward compatibility (tests may import them)
 class ReviewIssueOutput(BaseModel):
     """Structured output model for a single review issue."""
     severity: str = Field(description="Issue severity: critical, major, or minor")
@@ -37,6 +39,18 @@ class ReviewerOutput(BaseModel):
     issues: list[ReviewIssueOutput] = Field(default_factory=list, description="List of issues found. Empty list means no issues.")
 
 logger = logging.getLogger(__name__)
+
+# Instruction appended to every reviewer's system prompt to ensure
+# they call the submit_review tool with structured output.
+_SUBMIT_REVIEW_INSTRUCTION = (
+    "\n\n[IMPORTANT] After completing your review, you MUST call the "
+    "`submit_review` tool to submit your findings. Pass a JSON array of "
+    "issue objects as the `issues` argument. Each issue object must have "
+    '"severity" (one of "critical", "major", "minor", "suggestion") and '
+    '"content" (description of the issue). If you found no issues, pass "[]".'
+    "\n\nExample tool call:\n"
+    'submit_review(issues=\'[{"severity": "critical", "content": "Missing validation for edge case X"}]\')'
+)
 
 
 class AllReviewersFailedError(Exception):
@@ -84,21 +98,24 @@ class ReviewEngine:
                 if placeholder in rc.system_prompt:
                     rc.system_prompt = rc.system_prompt.replace(placeholder, value)
 
-        # Create Reviewer agents (with optional per-reviewer tools)
+        # Create Reviewer agents with submit_review tool (+ optional per-reviewer tools)
         self._reviewers: list[Agent] = []
         for rc in config.reviewers:
-            reviewer_tools = None
+            # Build tool list: submit_review + any per-reviewer tools
+            reviewer_tools: list = [submit_review]
             if rc.tools:
-                reviewer_tools = []
                 for tc in rc.tools:
                     tool_cls = import_from_path(tc.path)
                     reviewer_tools.append(tool_cls(context=config.context))
+
+            # Append submit_review instruction to system prompt
+            reviewer_system_prompt = rc.system_prompt + _SUBMIT_REVIEW_INSTRUCTION
+
             reviewer = Agent(
                 name=rc.name,
                 model=model,
-                system_message=rc.system_prompt,
-                tools=reviewer_tools if reviewer_tools else None,
-                output_schema=ReviewerOutput,
+                system_message=reviewer_system_prompt,
+                tools=reviewer_tools,
                 store_tool_messages=False,
                 add_history_to_context=False,
             )
@@ -122,6 +139,89 @@ class ReviewEngine:
                     continue
                 logger.warning("Agent '%s' failed after 2 attempts", agent.name, exc_info=True)
                 return None
+        return None
+
+    async def _safe_agent_call_full(self, agent: Agent, prompt: str):
+        """Like _safe_agent_call but returns the full RunOutput object.
+
+        Used for reviewer calls where we need to inspect tool calls.
+        Returns None on failure.
+        """
+        for attempt in range(2):
+            try:
+                result = await agent.arun(input=prompt, stream=False)
+                if result.content is not None or result.tools:
+                    return result
+                if attempt == 0:
+                    continue
+                return None
+            except Exception:
+                if attempt == 0:
+                    continue
+                logger.warning("Agent '%s' failed after 2 attempts", agent.name, exc_info=True)
+                return None
+        return None
+
+    # ------------------------------------------------------------------
+    # Tool call extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_tool_call_issues(run_output) -> list[dict] | None:
+        """Extract issues from submit_review tool call in RunOutput.
+
+        Checks run_output.tools (List[ToolExecution]) for a submit_review call.
+        Also falls back to checking run_output.messages for tool_calls.
+
+        Returns parsed issues list, or None if no submit_review call found.
+        """
+        # Strategy 1: Check run_output.tools (ToolExecution objects)
+        if run_output.tools:
+            for tool_exec in run_output.tools:
+                if tool_exec.tool_name == "submit_review":
+                    args = tool_exec.tool_args
+                    if args and isinstance(args, dict):
+                        issues_raw = args.get("issues", "[]")
+                        try:
+                            parsed = json.loads(issues_raw) if isinstance(issues_raw, str) else issues_raw
+                            if isinstance(parsed, list):
+                                return parsed
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+        # Strategy 2: Check messages for tool_calls
+        if run_output.messages:
+            for msg in run_output.messages:
+                if msg.tool_name == "submit_review" and msg.tool_args is not None:
+                    args = msg.tool_args
+                    if isinstance(args, dict):
+                        issues_raw = args.get("issues", "[]")
+                    elif isinstance(args, str):
+                        issues_raw = args
+                    else:
+                        continue
+                    try:
+                        parsed = json.loads(issues_raw) if isinstance(issues_raw, str) else issues_raw
+                        if isinstance(parsed, list):
+                            return parsed
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # Also check tool_calls list on assistant messages
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        func = tc.get("function", {})
+                        if func.get("name") == "submit_review":
+                            args_str = func.get("arguments", "{}")
+                            try:
+                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                                issues_raw = args.get("issues", "[]") if isinstance(args, dict) else "[]"
+                                parsed = json.loads(issues_raw) if isinstance(issues_raw, str) else issues_raw
+                                if isinstance(parsed, list):
+                                    return parsed
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
         return None
 
     # ------------------------------------------------------------------
@@ -164,12 +264,29 @@ class ReviewEngine:
                     f"请仔细审核上述内容，找出其中的问题。"
                 )
 
-            raw = await self._safe_agent_call(reviewer, prompt)
-            if raw is None:
+            # Use full RunOutput to inspect tool calls
+            run_output = await self._safe_agent_call_full(reviewer, prompt)
+            if run_output is None:
                 return None
 
-            # With output_model, raw might be a ReviewerOutput pydantic object serialized to string
-            # Try to parse as structured output first
+            # Try to extract structured data from submit_review tool call
+            tool_issues = self._extract_tool_call_issues(run_output)
+            if tool_issues is not None:
+                issues = [
+                    ReviewIssue(
+                        severity=item.get("severity", "minor"),
+                        content=item.get("content", ""),
+                    )
+                    for item in tool_issues
+                    if isinstance(item, dict)
+                ]
+                return ReviewerFeedback(reviewer_name=reviewer.name, issues=issues)
+
+            # Fallback: parse content as string (backward compatibility)
+            raw = run_output.content
+            if raw is None:
+                return ReviewerFeedback(reviewer_name=reviewer.name, issues=[])
+
             return self._parse_reviewer_output(reviewer.name, raw)
 
         results = await asyncio.gather(*[call_reviewer(r) for r in self._reviewers])
@@ -186,7 +303,7 @@ class ReviewEngine:
         Handles both structured output (ReviewerOutput pydantic object) and
         plain text/JSON string fallback.
         """
-        # Handle structured output (Pydantic model from output_model)
+        # Handle structured output (Pydantic model from output_model) — kept for backward compat
         if isinstance(raw, ReviewerOutput):
             issues = [
                 ReviewIssue(severity=i.severity, content=i.content)
