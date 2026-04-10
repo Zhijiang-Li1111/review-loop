@@ -7,6 +7,9 @@ import json
 import logging
 import re
 from dataclasses import asdict
+from typing import Optional
+
+from pydantic import BaseModel, Field
 
 from agno.agent import Agent
 
@@ -21,8 +24,42 @@ from review_loop.models import (
 )
 from review_loop.persistence import Archiver
 from review_loop.registry import import_from_path
+from review_loop.tools import submit_review, submit_revision, submit_verdict
+
+
+# Keep these for backward compatibility (tests may import them)
+class ReviewIssueOutput(BaseModel):
+    """Structured output model for a single review issue."""
+    severity: str = Field(description="Issue severity: critical, major, or minor")
+    content: str = Field(description="Description of the issue found")
+
+
+class ReviewerOutput(BaseModel):
+    """Structured output model for reviewer feedback."""
+    issues: list[ReviewIssueOutput] = Field(default_factory=list, description="List of issues found. Empty list means no issues.")
 
 logger = logging.getLogger(__name__)
+
+# Instruction appended to every reviewer's system prompt to ensure
+# they call the submit_review tool with structured output.
+_SUBMIT_REVIEW_INSTRUCTION = (
+    "\n\nAfter completing your review, call submit_review to submit your findings. "
+    "Pass an empty array if no issues were found."
+)
+
+# Instruction appended to the Author's prompt when evaluating feedback,
+# ensuring the Author calls submit_verdict with per-issue verdicts.
+_SUBMIT_VERDICT_INSTRUCTION = (
+    "\n\nAfter evaluating each reviewer issue, call submit_verdict to submit your verdicts. "
+    "This tool is only for verdicts — revised content goes in a separate submit_revision call."
+)
+
+# Instruction appended to the Author's prompt when applying changes,
+# ensuring the Author calls submit_revision with the complete revised content.
+_SUBMIT_REVISION_INSTRUCTION = (
+    "\n\nAfter applying changes, call submit_revision with the complete revised content. "
+    "This exact string replaces the previous version."
+)
 
 
 class AllReviewersFailedError(Exception):
@@ -51,23 +88,59 @@ class ReviewEngine:
 
         model = build_claude(config.model_config)
 
-        # Create Author agent (with tools)
-        self._author = Agent(
+        # Create Author verdict agent (external tools + submit_verdict)
+        verdict_tools = list(tool_instances) if tool_instances else []
+        verdict_tools.append(submit_verdict)
+
+        self._author_verdict = Agent(
             name=config.author.name,
             model=model,
             system_message=config.author.system_prompt,
-            tools=tool_instances if tool_instances else None,
+            tools=verdict_tools,
             store_tool_messages=False,
             add_history_to_context=False,
         )
 
-        # Create Reviewer agents (no tools)
+        # Create Author revision agent (submit_revision + external tools)
+        revision_tools = list(tool_instances) if tool_instances else []
+        revision_tools.append(submit_revision)
+
+        self._author_revision = Agent(
+            name=config.author.name,
+            model=model,
+            system_message=config.author.system_prompt,
+            tools=revision_tools,
+            store_tool_messages=False,
+            add_history_to_context=False,
+        )
+
+        # Expand template variables in reviewer system prompts
+        template_vars = {
+            "{{author.system_prompt}}": config.author.system_prompt,
+        }
+        for rc in config.reviewers:
+            for placeholder, value in template_vars.items():
+                if placeholder in rc.system_prompt:
+                    rc.system_prompt = rc.system_prompt.replace(placeholder, value)
+
+        # Create Reviewer agents with submit_review tool (+ optional per-reviewer tools)
         self._reviewers: list[Agent] = []
         for rc in config.reviewers:
+            # Build tool list: submit_review + any per-reviewer tools
+            reviewer_tools: list = [submit_review]
+            if rc.tools:
+                for tc in rc.tools:
+                    tool_cls = import_from_path(tc.path)
+                    reviewer_tools.append(tool_cls(context=config.context))
+
+            # Append submit_review instruction to system prompt
+            reviewer_system_prompt = rc.system_prompt + _SUBMIT_REVIEW_INSTRUCTION
+
             reviewer = Agent(
                 name=rc.name,
                 model=model,
-                system_message=rc.system_prompt,
+                system_message=reviewer_system_prompt,
+                tools=reviewer_tools,
                 store_tool_messages=False,
                 add_history_to_context=False,
             )
@@ -93,6 +166,205 @@ class ReviewEngine:
                 return None
         return None
 
+    async def _safe_agent_call_full(self, agent: Agent, prompt: str):
+        """Like _safe_agent_call but returns the full RunOutput object.
+
+        Used for reviewer calls where we need to inspect tool calls.
+        Returns None on failure.
+        """
+        for attempt in range(2):
+            try:
+                result = await agent.arun(input=prompt, stream=False)
+                if result.content is not None or result.tools:
+                    return result
+                if attempt == 0:
+                    continue
+                return None
+            except Exception:
+                if attempt == 0:
+                    continue
+                logger.warning("Agent '%s' failed after 2 attempts", agent.name, exc_info=True)
+                return None
+        return None
+
+    # ------------------------------------------------------------------
+    # Tool call extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_tool_call_issues(run_output) -> list[dict] | None:
+        """Extract issues from submit_review tool call in RunOutput.
+
+        Checks run_output.tools (List[ToolExecution]) for a submit_review call.
+        Also falls back to checking run_output.messages for tool_calls.
+
+        Returns parsed issues list, or None if no submit_review call found.
+        """
+        # Strategy 1: Check run_output.tools (ToolExecution objects)
+        if run_output.tools:
+            for tool_exec in run_output.tools:
+                if tool_exec.tool_name == "submit_review":
+                    args = tool_exec.tool_args
+                    if args and isinstance(args, dict):
+                        issues_raw = args.get("issues", "[]")
+                        try:
+                            parsed = json.loads(issues_raw) if isinstance(issues_raw, str) else issues_raw
+                            if isinstance(parsed, list):
+                                return parsed
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+        # Strategy 2: Check messages for tool_calls
+        if run_output.messages:
+            for msg in run_output.messages:
+                if msg.tool_name == "submit_review" and msg.tool_args is not None:
+                    args = msg.tool_args
+                    if isinstance(args, dict):
+                        issues_raw = args.get("issues", "[]")
+                    elif isinstance(args, str):
+                        issues_raw = args
+                    else:
+                        continue
+                    try:
+                        parsed = json.loads(issues_raw) if isinstance(issues_raw, str) else issues_raw
+                        if isinstance(parsed, list):
+                            return parsed
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                # Also check tool_calls list on assistant messages
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        func = tc.get("function", {})
+                        if func.get("name") == "submit_review":
+                            args_str = func.get("arguments", "{}")
+                            try:
+                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                                issues_raw = args.get("issues", "[]") if isinstance(args, dict) else "[]"
+                                parsed = json.loads(issues_raw) if isinstance(issues_raw, str) else issues_raw
+                                if isinstance(parsed, list):
+                                    return parsed
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+        return None
+
+    @staticmethod
+    def _extract_submit_verdict(run_output) -> list[AuthorVerdictItem] | None:
+        """Extract verdicts from a submit_verdict tool call in RunOutput.
+
+        Returns parsed list of AuthorVerdictItem, or None if no submit_verdict
+        call was found.
+        """
+
+        def _parse_verdicts(raw) -> list[AuthorVerdictItem] | None:
+            try:
+                verdicts = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+            if not isinstance(verdicts, list):
+                return None
+
+            items = []
+            for item in verdicts:
+                if isinstance(item, dict):
+                    items.append(
+                        AuthorVerdictItem(
+                            reviewer=item.get("reviewer", ""),
+                            issue_index=item.get("issue_index", 0),
+                            verdict=item.get("verdict", "unclear"),
+                            reason=item.get("reason", ""),
+                        )
+                    )
+            return items
+
+        # Strategy 1: Check run_output.tools (ToolExecution objects)
+        if run_output.tools:
+            for tool_exec in run_output.tools:
+                if tool_exec.tool_name == "submit_verdict":
+                    args = tool_exec.tool_args
+                    if args and isinstance(args, dict):
+                        result = _parse_verdicts(args.get("verdicts", "[]"))
+                        if result is not None:
+                            return result
+
+        # Strategy 2: Check messages for tool_calls
+        if run_output.messages:
+            for msg in run_output.messages:
+                if msg.tool_name == "submit_verdict" and msg.tool_args is not None:
+                    args = msg.tool_args
+                    if isinstance(args, dict):
+                        result = _parse_verdicts(args.get("verdicts", "[]"))
+                        if result is not None:
+                            return result
+
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        func = tc.get("function", {})
+                        if func.get("name") == "submit_verdict":
+                            args_str = func.get("arguments", "{}")
+                            try:
+                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                                if isinstance(args, dict):
+                                    result = _parse_verdicts(args.get("verdicts", "[]"))
+                                    if result is not None:
+                                        return result
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+        return None
+
+    @staticmethod
+    def _extract_submit_revision(run_output) -> str | None:
+        """Extract updated_content from a submit_revision tool call.
+
+        Returns the updated content string, or None if no submit_revision call
+        was found.
+        """
+
+        def _try_parse(args: dict) -> str | None:
+            updated_content = args.get("updated_content")
+            if updated_content is None:
+                return None
+            return updated_content
+
+        # Strategy 1: Check run_output.tools (ToolExecution objects)
+        if run_output.tools:
+            for tool_exec in run_output.tools:
+                if tool_exec.tool_name == "submit_revision":
+                    args = tool_exec.tool_args
+                    if args and isinstance(args, dict):
+                        result = _try_parse(args)
+                        if result is not None:
+                            return result
+
+        # Strategy 2: Check messages for tool_calls
+        if run_output.messages:
+            for msg in run_output.messages:
+                if msg.tool_name == "submit_revision" and msg.tool_args is not None:
+                    args = msg.tool_args
+                    if isinstance(args, dict):
+                        result = _try_parse(args)
+                        if result is not None:
+                            return result
+
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        func = tc.get("function", {})
+                        if func.get("name") == "submit_revision":
+                            args_str = func.get("arguments", "{}")
+                            try:
+                                args = json.loads(args_str) if isinstance(args_str, str) else args_str
+                                if isinstance(args, dict):
+                                    result = _try_parse(args)
+                                    if result is not None:
+                                        return result
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+
+        return None
+
     # ------------------------------------------------------------------
     # Author: Generate initial content
     # ------------------------------------------------------------------
@@ -100,9 +372,9 @@ class ReviewEngine:
     async def _author_generate(self, context: str) -> str:
         prompt = (
             f"{context}\n\n"
-            f"请基于上述背景资料，生成初始内容。"
+            f"{self._config.author.initial_prompt}"
         )
-        content = await self._safe_agent_call(self._author, prompt)
+        content = await self._safe_agent_call(self._author_revision, prompt)
         if content is None:
             raise AllReviewersFailedError("Author failed to generate initial content")
         return content
@@ -125,23 +397,36 @@ class ReviewEngine:
                     f"{prev_ctx}\n\n"
                     f"以下是修改后的内容：\n\n{content}\n\n"
                     f"请审核修改后的内容。对于 Author 接受并修改的 issue，检查修改是否真正解决了问题。"
-                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。\n\n"
-                    f"请返回 JSON 格式：\n"
-                    f'{{"issues": [{{"severity": "critical|major|minor", "content": "问题描述"}}]}}\n'
-                    f"如果没有问题，返回 {{\"issues\": []}}"
+                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。"
                 )
             else:
                 prompt = (
                     f"以下是需要审核的内容：\n\n{content}\n\n"
-                    f"请仔细审核上述内容，找出其中的问题。\n\n"
-                    f"请返回 JSON 格式：\n"
-                    f'{{"issues": [{{"severity": "critical|major|minor", "content": "问题描述"}}]}}\n'
-                    f"如果没有问题，返回 {{\"issues\": []}}"
+                    f"请仔细审核上述内容，找出其中的问题。"
                 )
 
-            raw = await self._safe_agent_call(reviewer, prompt)
-            if raw is None:
+            # Use full RunOutput to inspect tool calls
+            run_output = await self._safe_agent_call_full(reviewer, prompt)
+            if run_output is None:
                 return None
+
+            # Try to extract structured data from submit_review tool call
+            tool_issues = self._extract_tool_call_issues(run_output)
+            if tool_issues is not None:
+                issues = [
+                    ReviewIssue(
+                        severity=item.get("severity", "minor"),
+                        content=item.get("content", ""),
+                    )
+                    for item in tool_issues
+                    if isinstance(item, dict)
+                ]
+                return ReviewerFeedback(reviewer_name=reviewer.name, issues=issues)
+
+            # Fallback: parse content as string (backward compatibility)
+            raw = run_output.content
+            if raw is None:
+                return ReviewerFeedback(reviewer_name=reviewer.name, issues=[])
 
             return self._parse_reviewer_output(reviewer.name, raw)
 
@@ -153,14 +438,34 @@ class ReviewEngine:
 
         return feedbacks
 
-    def _parse_reviewer_output(self, name: str, raw: str) -> ReviewerFeedback:
-        """Parse reviewer JSON output into ReviewerFeedback."""
+    def _parse_reviewer_output(self, name: str, raw) -> ReviewerFeedback:
+        """Parse reviewer output into ReviewerFeedback.
+        
+        Handles both structured output (ReviewerOutput pydantic object) and
+        plain text/JSON string fallback.
+        """
+        # Handle structured output (Pydantic model from output_model) — kept for backward compat
+        if isinstance(raw, ReviewerOutput):
+            issues = [
+                ReviewIssue(severity=i.severity, content=i.content)
+                for i in raw.issues
+            ]
+            return ReviewerFeedback(reviewer_name=name, issues=issues)
+
+        # Fallback: parse as string
+        raw = str(raw)
         try:
-            match = re.search(r"\{[^{}]*\"issues\"\s*:\s*\[.*?\]\s*\}", raw, re.DOTALL)
+            # Try to find JSON with "issues" key - use greedy match to handle nested braces
+            match = re.search(r'\{[^{]*"issues"\s*:\s*\[.*\]\s*\}', raw, re.DOTALL)
             if match:
                 data = json.loads(match.group())
             else:
-                data = json.loads(raw)
+                # Try extracting from markdown code block
+                code_match = re.search(r'```(?:json)?\s*(\{.*?"issues".*?\})\s*```', raw, re.DOTALL)
+                if code_match:
+                    data = json.loads(code_match.group(1))
+                else:
+                    data = json.loads(raw)
         except (json.JSONDecodeError, AttributeError):
             logger.warning("Reviewer '%s' returned non-JSON output, treating as no issues", name)
             return ReviewerFeedback(reviewer_name=name, issues=[])
@@ -176,33 +481,85 @@ class ReviewEngine:
         return ReviewerFeedback(reviewer_name=name, issues=issues)
 
     # ------------------------------------------------------------------
-    # Author: Process feedback
+    # Author: Evaluate feedback (verdict only)
     # ------------------------------------------------------------------
 
-    async def _author_process_feedback(
+    async def _author_evaluate_feedback(
         self,
         content: str,
         feedbacks: list[ReviewerFeedback],
-    ) -> AuthorResponse:
-        """Author reviews all issues and outputs verdicts + updated content."""
+    ) -> list[AuthorVerdictItem]:
+        """Author evaluates each issue and outputs per-issue verdicts.
+
+        The Author is expected to call submit_verdict with a JSON array of
+        verdict objects. If no tool call is found, we fall back to JSON
+        parsing from the text response.
+        """
         issues_text = self._format_issues_for_author(feedbacks)
         prompt = (
             f"{self._config.author.receiving_review_prompt}\n\n"
             f"当前内容：\n\n{content}\n\n"
-            f"审核员反馈：\n\n{issues_text}\n\n"
-            f"请对每个 issue 做出判断，然后输出修改后的完整内容。\n\n"
-            f"请返回 JSON 格式：\n"
-            f'{{"responses": [{{"reviewer": "审核员名", "issue_index": 0, '
-            f'"verdict": "accept|reject|unclear", "reason": "理由"}}], '
-            f'"updated_content": "修改后的完整内容"}}'
+            f"审核员反馈：\n\n{issues_text}"
+            f"{_SUBMIT_VERDICT_INSTRUCTION}"
         )
 
-        raw = await self._safe_agent_call(self._author, prompt)
-        if raw is None:
-            # Fallback: keep content unchanged
-            return AuthorResponse(responses=[], updated_content=content)
+        run_output = await self._safe_agent_call_full(self._author_verdict, prompt)
+        if run_output is None:
+            return []
 
-        return self._parse_author_response(raw, content)
+        # Strategy 1: Extract from submit_verdict tool call
+        verdicts = self._extract_submit_verdict(run_output)
+        if verdicts is not None:
+            return verdicts
+
+        # Strategy 2: Fall back to JSON parsing from text content
+        raw = run_output.content
+        if raw is None:
+            return []
+
+        return self._parse_verdict_response(raw)
+
+    # ------------------------------------------------------------------
+    # Author: Apply changes (revision only)
+    # ------------------------------------------------------------------
+
+    async def _author_apply_changes(
+        self,
+        content: str,
+        verdicts: list[AuthorVerdictItem],
+        feedbacks: list[ReviewerFeedback],
+    ) -> str:
+        """Author applies accepted changes and outputs the full revised content.
+
+        The Author is expected to call submit_revision with the complete
+        revised content. If no tool call is found, we fall back to treating
+        the text response as the content.
+        """
+        # Format verdicts for the Author prompt
+        verdict_text = self._format_verdicts_for_author(verdicts, feedbacks)
+        prompt = (
+            f"以下是当前内容：\n\n{content}\n\n"
+            f"以下是你对审核意见的裁定：\n\n{verdict_text}\n\n"
+            f"请根据你接受（accept）的意见修改内容，输出完整的修改后内容。"
+            f"{_SUBMIT_REVISION_INSTRUCTION}"
+        )
+
+        run_output = await self._safe_agent_call_full(self._author_revision, prompt)
+        if run_output is None:
+            return content
+
+        # Strategy 1: Extract from submit_revision tool call
+        updated_content = self._extract_submit_revision(run_output)
+        if updated_content is not None:
+            return updated_content
+
+        # Strategy 2: Fall back to text content
+        raw = run_output.content
+        if raw is None:
+            return content
+
+        # If the raw response looks like it could be the full content, use it
+        return raw
 
     def _format_issues_for_author(self, feedbacks: list[ReviewerFeedback]) -> str:
         parts: list[str] = []
@@ -214,8 +571,60 @@ class ReviewEngine:
                 parts.append(f"  issue {i} ({issue.severity}): {issue.content}")
         return "\n".join(parts)
 
+    def _format_verdicts_for_author(
+        self,
+        verdicts: list[AuthorVerdictItem],
+        feedbacks: list[ReviewerFeedback],
+    ) -> str:
+        """Format verdicts alongside original issues for the revision prompt."""
+        verdict_map: dict[tuple[str, int], AuthorVerdictItem] = {}
+        for item in verdicts:
+            verdict_map[(item.reviewer, item.issue_index)] = item
+
+        parts: list[str] = []
+        for fb in feedbacks:
+            if not fb.issues:
+                continue
+            parts.append(f"[{fb.reviewer_name}]")
+            for i, issue in enumerate(fb.issues):
+                parts.append(f"  issue {i} ({issue.severity}): {issue.content}")
+                v = verdict_map.get((fb.reviewer_name, i))
+                if v:
+                    parts.append(f"  -> 裁定: [{v.verdict.upper()}] {v.reason}")
+                else:
+                    parts.append(f"  -> 裁定: [未回应]")
+        return "\n".join(parts)
+
+    def _parse_verdict_response(self, raw: str) -> list[AuthorVerdictItem]:
+        """Parse author verdict JSON output into list of AuthorVerdictItem."""
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, AttributeError):
+            logger.warning("Author returned non-JSON verdict output")
+            return []
+
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("verdicts", data.get("responses", []))
+        else:
+            return []
+
+        responses = []
+        for item in items:
+            if isinstance(item, dict):
+                responses.append(
+                    AuthorVerdictItem(
+                        reviewer=item.get("reviewer", ""),
+                        issue_index=item.get("issue_index", 0),
+                        verdict=item.get("verdict", "unclear"),
+                        reason=item.get("reason", ""),
+                    )
+                )
+        return responses
+
     def _parse_author_response(self, raw: str, fallback_content: str) -> AuthorResponse:
-        """Parse author JSON output into AuthorResponse."""
+        """Parse author JSON output into AuthorResponse (kept for backward compat)."""
         try:
             # Try to find JSON block
             match = re.search(r"\{.*\"responses\".*\"updated_content\".*\}", raw, re.DOTALL)
@@ -248,12 +657,12 @@ class ReviewEngine:
     def _build_reviewer_context(
         self,
         feedbacks: list[ReviewerFeedback],
-        author_response: AuthorResponse,
+        verdicts: list[AuthorVerdictItem],
     ) -> dict[str, str]:
         """Build context for each reviewer: their issues + Author's responses."""
-        # Index author responses by (reviewer, issue_index)
+        # Index author verdicts by (reviewer, issue_index)
         verdict_map: dict[tuple[str, int], AuthorVerdictItem] = {}
-        for item in author_response.responses:
+        for item in verdicts:
             verdict_map[(item.reviewer, item.issue_index)] = item
 
         ctx: dict[str, str] = {}
@@ -326,25 +735,30 @@ class ReviewEngine:
                         unresolved_issues=[],
                     )
 
-                # Author processes feedback
-                author_response = await self._author_process_feedback(content, feedbacks)
+                # Author evaluates feedback (verdict only)
+                verdicts = await self._author_evaluate_feedback(content, feedbacks)
+
+                self._archiver.save_author_verdict(
+                    round_num,
+                    [asdict(v) for v in verdicts],
+                )
+
+                # Author applies changes (revision only)
+                updated_content = await self._author_apply_changes(content, verdicts, feedbacks)
 
                 self._archiver.save_author_response(
                     round_num,
-                    {
-                        "responses": [asdict(r) for r in author_response.responses],
-                        "updated_content": author_response.updated_content,
-                    },
+                    {"updated_content": updated_content},
                 )
 
                 rounds_completed = round_num
 
                 # Update content and prepare next round
-                content = author_response.updated_content
+                content = updated_content
                 self._archiver.save_author_content(round_num + 1, content)
 
                 # Build per-reviewer context for next round
-                per_reviewer_ctx = self._build_reviewer_context(feedbacks, author_response)
+                per_reviewer_ctx = self._build_reviewer_context(feedbacks, verdicts)
 
             # Max rounds reached
             # Collect last round's unresolved issues

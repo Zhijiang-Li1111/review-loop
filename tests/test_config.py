@@ -170,6 +170,30 @@ class TestConfigLoaderOptionalFields:
         cfg = ConfigLoader.load(str(path))
         assert cfg.context_builder == "my_pkg.context.build"
 
+    def test_reviewer_tools_parsed(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "Check.", "tools": [{"path": "pkg.SearchTools"}]},
+            {"name": "R2", "system_prompt": "Review."},
+        ]
+        path = tmp_path / "rt.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.reviewers[0].tools is not None
+        assert len(cfg.reviewers[0].tools) == 1
+        assert cfg.reviewers[0].tools[0].path == "pkg.SearchTools"
+        assert cfg.reviewers[1].tools is None
+
+    def test_reviewer_tool_missing_path_raises(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "Check.", "tools": [{"name": "bad"}]},
+        ]
+        path = tmp_path / "bad_rt.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        with pytest.raises(ValueError, match="path"):
+            ConfigLoader.load(str(path))
+
 
 class TestResolveEnv:
     def test_env_prefix_resolves(self, monkeypatch):
@@ -224,3 +248,17 @@ class TestConfigLoaderModelFields:
         assert cfg.model_config.api_key == "sk-resolved"
         assert cfg.model_config.temperature == 0.7
         assert cfg.model_config.max_tokens == 4096
+
+
+class TestAuthorInitialPrompt:
+    def test_default_initial_prompt(self, sample_config_yaml):
+        cfg = ConfigLoader.load(sample_config_yaml)
+        assert cfg.author.initial_prompt == "请基于上述背景资料，生成初始内容。"
+
+    def test_custom_initial_prompt(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["author"]["initial_prompt"] = "请基于以上选题讨论结论，生成一份完整的文章大纲。"
+        path = tmp_path / "custom_prompt.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.author.initial_prompt == "请基于以上选题讨论结论，生成一份完整的文章大纲。"

@@ -64,17 +64,22 @@ class ToolConfig:
     path: str
 
 
+_DEFAULT_INITIAL_PROMPT = "请基于上述背景资料，生成初始内容。"
+
+
 @dataclass
 class AuthorConfig:
     name: str
     system_prompt: str
     receiving_review_prompt: str
+    initial_prompt: str = _DEFAULT_INITIAL_PROMPT
 
 
 @dataclass
 class ReviewerConfig:
     name: str
     system_prompt: str
+    tools: list[ToolConfig] | None = None
 
 
 @dataclass
@@ -126,13 +131,29 @@ class ConfigLoader:
             name=author_raw["name"],
             system_prompt=author_raw["system_prompt"],
             receiving_review_prompt=author_raw.get("receiving_review_prompt", ""),
+            initial_prompt=author_raw.get("initial_prompt", _DEFAULT_INITIAL_PROMPT),
         )
 
         # --- reviewers ---
         reviewers = []
         for r in raw["reviewers"]:
+            reviewer_tools: list[ToolConfig] | None = None
+            raw_reviewer_tools = r.get("tools")
+            if raw_reviewer_tools:
+                reviewer_tools = []
+                for j, rt in enumerate(raw_reviewer_tools):
+                    if not isinstance(rt, dict) or "path" not in rt:
+                        raise ValueError(
+                            f"reviewers['{r.get('name', '?')}'].tools[{j}]: "
+                            f"each tool must be a dict with a 'path' key, got {rt!r}"
+                        )
+                    reviewer_tools.append(ToolConfig(path=rt["path"]))
             reviewers.append(
-                ReviewerConfig(name=r["name"], system_prompt=r["system_prompt"])
+                ReviewerConfig(
+                    name=r["name"],
+                    system_prompt=r["system_prompt"],
+                    tools=reviewer_tools,
+                )
             )
         if not reviewers:
             raise ValueError("'reviewers' list must not be empty")

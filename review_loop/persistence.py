@@ -49,6 +49,10 @@ class Archiver:
         path = Path(self._session_dir) / "rounds" / f"round_{round_num}_reviewer_{name}.json"
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
+    def save_author_verdict(self, round_num: int, data: list) -> None:
+        path = Path(self._session_dir) / "rounds" / f"round_{round_num}_author_verdict.json"
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+
     def save_author_response(self, round_num: int, data: dict) -> None:
         path = Path(self._session_dir) / "rounds" / f"round_{round_num}_author_response.json"
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
