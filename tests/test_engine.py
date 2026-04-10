@@ -164,10 +164,10 @@ class TestAgentCreation:
             config = _make_config(tools=[ToolConfig(path="pkg.FakeTool")])
             engine = ReviewEngine(config)
 
-        # Verdict agent (first call) should have only submit_verdict
+        # Verdict agent (first call) should have FakeTool + submit_verdict
         verdict_call = MockAgent.call_args_list[0]
         assert verdict_call.kwargs.get("tools") is not None
-        assert len(verdict_call.kwargs["tools"]) == 1
+        assert len(verdict_call.kwargs["tools"]) == 2  # FakeTool + submit_verdict
         assert submit_verdict in verdict_call.kwargs["tools"]
 
         # Revision agent (second call) should have FakeTool + submit_revision

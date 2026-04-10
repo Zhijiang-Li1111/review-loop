@@ -109,12 +109,15 @@ class ReviewEngine:
 
         model = build_claude(config.model_config)
 
-        # Create Author verdict agent (only submit_verdict tool)
+        # Create Author verdict agent (external tools + submit_verdict)
+        verdict_tools = list(tool_instances) if tool_instances else []
+        verdict_tools.append(submit_verdict)
+
         self._author_verdict = Agent(
             name=config.author.name,
             model=model,
             system_message=config.author.system_prompt,
-            tools=[submit_verdict],
+            tools=verdict_tools,
             store_tool_messages=False,
             add_history_to_context=False,
         )
