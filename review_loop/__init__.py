@@ -20,7 +20,7 @@ from review_loop.models import (
     RoundRecord,
 )
 from review_loop.registry import import_from_path
-from review_loop.tools import submit_review, submit_verdict
+from review_loop.tools import submit_review, submit_revision, submit_verdict
 
 __all__ = [
     "AllReviewersFailedError",
@@ -41,5 +41,6 @@ __all__ = [
     "import_from_path",
     "resolve_env",
     "submit_review",
+    "submit_revision",
     "submit_verdict",
 ]

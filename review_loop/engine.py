@@ -7,8 +7,6 @@ import json
 import logging
 import re
 from dataclasses import asdict
-from typing import Optional
-
 from pydantic import BaseModel, Field
 
 from agno.agent import Agent
@@ -78,6 +76,24 @@ class AllReviewersFailedError(Exception):
 
 class ReviewEngine:
     """Run a structured write-review loop to convergence or max rounds."""
+
+    @staticmethod
+    def _issue_from_dict(d: dict) -> ReviewIssue:
+        """Construct a ReviewIssue from a raw dict with safe defaults."""
+        return ReviewIssue(
+            severity=d.get("severity", "minor"),
+            content=d.get("content", ""),
+            why=d.get("why", ""),
+            pattern=d.get("pattern", ""),
+        )
+
+    @staticmethod
+    def _append_why_pattern(parts: list[str], issue: ReviewIssue) -> None:
+        """Append why/pattern lines to parts list if non-empty."""
+        if issue.why:
+            parts.append(f"    why: {issue.why}")
+        if issue.pattern:
+            parts.append(f"    pattern: {issue.pattern}")
 
     def __init__(self, config: ReviewConfig):
         self._config = config
@@ -424,12 +440,7 @@ class ReviewEngine:
             tool_issues = self._extract_tool_call_issues(run_output)
             if tool_issues is not None:
                 issues = [
-                    ReviewIssue(
-                        severity=item.get("severity", "minor"),
-                        content=item.get("content", ""),
-                        why=item.get("why", ""),
-                        pattern=item.get("pattern", ""),
-                    )
+                    self._issue_from_dict(item)
                     for item in tool_issues
                     if isinstance(item, dict)
                 ]
@@ -462,8 +473,8 @@ class ReviewEngine:
                 ReviewIssue(
                     severity=i.severity,
                     content=i.content,
-                    why=getattr(i, "why", ""),
-                    pattern=getattr(i, "pattern", ""),
+                    why=i.why,
+                    pattern=i.pattern,
                 )
                 for i in raw.issues
             ]
@@ -472,7 +483,7 @@ class ReviewEngine:
         # Fallback: parse as string
         raw = str(raw)
         try:
-            # Try to find JSON with "issues" key - use greedy match to handle nested braces
+            # Try to find JSON with "issues" key (no nested objects before the key)
             match = re.search(r'\{[^{]*"issues"\s*:\s*\[.*\]\s*\}', raw, re.DOTALL)
             if match:
                 data = json.loads(match.group())
@@ -489,14 +500,7 @@ class ReviewEngine:
 
         issues = []
         for item in data.get("issues", []):
-            issues.append(
-                ReviewIssue(
-                    severity=item.get("severity", "minor"),
-                    content=item.get("content", ""),
-                    why=item.get("why", ""),
-                    pattern=item.get("pattern", ""),
-                )
-            )
+            issues.append(self._issue_from_dict(item))
         return ReviewerFeedback(reviewer_name=name, issues=issues)
 
     # ------------------------------------------------------------------
@@ -588,10 +592,7 @@ class ReviewEngine:
             parts.append(f"[{fb.reviewer_name}]")
             for i, issue in enumerate(fb.issues):
                 parts.append(f"  issue {i} ({issue.severity}): {issue.content}")
-                if issue.why:
-                    parts.append(f"    why: {issue.why}")
-                if issue.pattern:
-                    parts.append(f"    pattern: {issue.pattern}")
+                self._append_why_pattern(parts, issue)
         return "\n".join(parts)
 
     def _format_verdicts_for_author(
@@ -611,10 +612,7 @@ class ReviewEngine:
             parts.append(f"[{fb.reviewer_name}]")
             for i, issue in enumerate(fb.issues):
                 parts.append(f"  issue {i} ({issue.severity}): {issue.content}")
-                if issue.why:
-                    parts.append(f"    why: {issue.why}")
-                if issue.pattern:
-                    parts.append(f"    pattern: {issue.pattern}")
+                self._append_why_pattern(parts, issue)
                 v = verdict_map.get((fb.reviewer_name, i))
                 if v:
                     parts.append(f"  -> 裁定: [{v.verdict.upper()}] {v.reason}")
@@ -699,10 +697,7 @@ class ReviewEngine:
             parts: list[str] = [f"[上一轮你提出的 issues 及 Author 的回应]"]
             for i, issue in enumerate(fb.issues):
                 parts.append(f"\nissue {i} ({issue.severity}): {issue.content}")
-                if issue.why:
-                    parts.append(f"  why: {issue.why}")
-                if issue.pattern:
-                    parts.append(f"  pattern: {issue.pattern}")
+                self._append_why_pattern(parts, issue)
                 verdict_item = verdict_map.get((fb.reviewer_name, i))
                 if verdict_item:
                     tag = verdict_item.verdict.upper()
