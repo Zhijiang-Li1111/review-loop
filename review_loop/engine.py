@@ -32,6 +32,8 @@ class ReviewIssueOutput(BaseModel):
     """Structured output model for a single review issue."""
     severity: str = Field(description="Issue severity: critical, major, or minor")
     content: str = Field(description="Description of the issue found")
+    why: str = Field(default="", description="Why this is a problem: what principle it violates or what consequence it causes. Helps the author understand the root cause and fix similar issues proactively.")
+    pattern: str = Field(default="", description="Similar pattern hint: suggest the author check the entire text for similar occurrences of this issue type.")
 
 
 class ReviewerOutput(BaseModel):
@@ -44,7 +46,10 @@ logger = logging.getLogger(__name__)
 # they call the submit_review tool with structured output.
 _SUBMIT_REVIEW_INSTRUCTION = (
     "\n\nAfter completing your review, call submit_review to submit your findings. "
-    "Pass an empty array if no issues were found."
+    "Pass an empty array if no issues were found. "
+    "Each issue should include why (explain why this is a problem) and pattern "
+    "(suggest checking the full text for similar occurrences). "
+    "These fields help the author fix problems proactively."
 )
 
 # Instruction appended to the Author's prompt when evaluating feedback,
@@ -422,6 +427,8 @@ class ReviewEngine:
                     ReviewIssue(
                         severity=item.get("severity", "minor"),
                         content=item.get("content", ""),
+                        why=item.get("why", ""),
+                        pattern=item.get("pattern", ""),
                     )
                     for item in tool_issues
                     if isinstance(item, dict)
@@ -452,7 +459,12 @@ class ReviewEngine:
         # Handle structured output (Pydantic model from output_model) — kept for backward compat
         if isinstance(raw, ReviewerOutput):
             issues = [
-                ReviewIssue(severity=i.severity, content=i.content)
+                ReviewIssue(
+                    severity=i.severity,
+                    content=i.content,
+                    why=getattr(i, "why", ""),
+                    pattern=getattr(i, "pattern", ""),
+                )
                 for i in raw.issues
             ]
             return ReviewerFeedback(reviewer_name=name, issues=issues)
@@ -481,6 +493,8 @@ class ReviewEngine:
                 ReviewIssue(
                     severity=item.get("severity", "minor"),
                     content=item.get("content", ""),
+                    why=item.get("why", ""),
+                    pattern=item.get("pattern", ""),
                 )
             )
         return ReviewerFeedback(reviewer_name=name, issues=issues)
@@ -574,6 +588,10 @@ class ReviewEngine:
             parts.append(f"[{fb.reviewer_name}]")
             for i, issue in enumerate(fb.issues):
                 parts.append(f"  issue {i} ({issue.severity}): {issue.content}")
+                if issue.why:
+                    parts.append(f"    why: {issue.why}")
+                if issue.pattern:
+                    parts.append(f"    pattern: {issue.pattern}")
         return "\n".join(parts)
 
     def _format_verdicts_for_author(
@@ -593,6 +611,10 @@ class ReviewEngine:
             parts.append(f"[{fb.reviewer_name}]")
             for i, issue in enumerate(fb.issues):
                 parts.append(f"  issue {i} ({issue.severity}): {issue.content}")
+                if issue.why:
+                    parts.append(f"    why: {issue.why}")
+                if issue.pattern:
+                    parts.append(f"    pattern: {issue.pattern}")
                 v = verdict_map.get((fb.reviewer_name, i))
                 if v:
                     parts.append(f"  -> 裁定: [{v.verdict.upper()}] {v.reason}")
@@ -677,6 +699,10 @@ class ReviewEngine:
             parts: list[str] = [f"[上一轮你提出的 issues 及 Author 的回应]"]
             for i, issue in enumerate(fb.issues):
                 parts.append(f"\nissue {i} ({issue.severity}): {issue.content}")
+                if issue.why:
+                    parts.append(f"  why: {issue.why}")
+                if issue.pattern:
+                    parts.append(f"  pattern: {issue.pattern}")
                 verdict_item = verdict_map.get((fb.reviewer_name, i))
                 if verdict_item:
                     tag = verdict_item.verdict.upper()

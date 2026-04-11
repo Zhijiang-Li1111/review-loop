@@ -29,6 +29,10 @@ def submit_review(issues: str) -> str:
         issues: A JSON array of issue objects. Each object must have:
             - "severity": one of "critical", "major", "minor", "suggestion"
             - "content": description of the issue found
+            - "why": (optional) why this is a problem — what principle it violates
+              or what consequence it causes
+            - "pattern": (optional) similar pattern hint — suggest the author check
+              the entire text for similar occurrences of this issue type
 
             Pass "[]" (empty JSON array) if no issues were found.
 

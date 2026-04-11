@@ -1772,3 +1772,270 @@ class TestAuthorToolCallIntegration:
 
         assert len(captured_prompts) == 1
         assert "call submit_revision" in captured_prompts[0]
+
+
+# ==================================================================
+# Tests for why and pattern fields
+# ==================================================================
+
+
+class TestReviewIssueOutputSchema:
+    """Verify ReviewIssueOutput Pydantic model includes why and pattern."""
+
+    def test_schema_contains_why_and_pattern(self):
+        from review_loop.engine import ReviewIssueOutput
+
+        schema = ReviewIssueOutput.model_json_schema()
+        props = schema["properties"]
+        assert "why" in props
+        assert "pattern" in props
+
+    def test_defaults(self):
+        from review_loop.engine import ReviewIssueOutput
+
+        issue = ReviewIssueOutput(severity="minor", content="Typo")
+        assert issue.why == ""
+        assert issue.pattern == ""
+
+    def test_explicit_values(self):
+        from review_loop.engine import ReviewIssueOutput
+
+        issue = ReviewIssueOutput(
+            severity="major",
+            content="Missing source",
+            why="Violates evidence principle",
+            pattern="Check all statistics for source",
+        )
+        assert issue.why == "Violates evidence principle"
+        assert issue.pattern == "Check all statistics for source"
+
+
+class TestWhyPatternInToolExtraction:
+    """Test that why and pattern are preserved through tool call extraction."""
+
+    def test_extract_with_why_pattern(self):
+        from review_loop.engine import ReviewEngine
+
+        issues_json = json.dumps([
+            {
+                "severity": "major",
+                "content": "Missing data",
+                "why": "No source cited",
+                "pattern": "Check all data claims",
+            }
+        ])
+        run_output = MockRunOutput(
+            tools=[MockToolExecution(
+                tool_name="submit_review",
+                tool_args={"issues": issues_json},
+            )],
+        )
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]["why"] == "No source cited"
+        assert result[0]["pattern"] == "Check all data claims"
+
+    def test_extract_without_why_pattern_defaults_to_empty(self):
+        """Backward compat: old-style issues without why/pattern."""
+        from review_loop.engine import ReviewEngine
+
+        issues_json = json.dumps([
+            {"severity": "minor", "content": "Typo"}
+        ])
+        run_output = MockRunOutput(
+            tools=[MockToolExecution(
+                tool_name="submit_review",
+                tool_args={"issues": issues_json},
+            )],
+        )
+        result = ReviewEngine._extract_tool_call_issues(run_output)
+        assert result is not None
+        assert "why" not in result[0]  # raw dict doesn't have it
+        # But when constructed into ReviewIssue, defaults kick in
+
+
+class TestWhyPatternSerialization:
+    """Test that why and pattern survive JSON serialization (dataclasses.asdict)."""
+
+    def test_serialization_includes_why_pattern(self):
+        import dataclasses
+
+        from review_loop.models import ReviewerFeedback, ReviewIssue
+
+        fb = ReviewerFeedback(
+            reviewer_name="R1",
+            issues=[
+                ReviewIssue(
+                    severity="critical",
+                    content="Logic gap",
+                    why="Conclusion doesn't follow from premise",
+                    pattern="Check all if-then arguments",
+                )
+            ],
+        )
+        data = dataclasses.asdict(fb)
+        issue_dict = data["issues"][0]
+        assert issue_dict["why"] == "Conclusion doesn't follow from premise"
+        assert issue_dict["pattern"] == "Check all if-then arguments"
+
+    def test_serialization_empty_defaults(self):
+        import dataclasses
+
+        from review_loop.models import ReviewIssue
+
+        issue = ReviewIssue(severity="minor", content="Typo")
+        d = dataclasses.asdict(issue)
+        assert d["why"] == ""
+        assert d["pattern"] == ""
+
+
+class TestWhyPatternInFormatting:
+    """Test that Author sees why and pattern in formatted feedback."""
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_format_issues_includes_why_pattern(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+        from review_loop.models import ReviewerFeedback, ReviewIssue
+
+        config = _make_config(num_reviewers=1)
+        engine = ReviewEngine(config)
+
+        feedbacks = [
+            ReviewerFeedback(
+                reviewer_name="R1",
+                issues=[
+                    ReviewIssue(
+                        severity="major",
+                        content="Missing source",
+                        why="Readers cannot verify",
+                        pattern="Check all claims",
+                    )
+                ],
+            )
+        ]
+
+        formatted = engine._format_issues_for_author(feedbacks)
+        assert "why: Readers cannot verify" in formatted
+        assert "pattern: Check all claims" in formatted
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_format_issues_omits_empty_why_pattern(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+        from review_loop.models import ReviewerFeedback, ReviewIssue
+
+        config = _make_config(num_reviewers=1)
+        engine = ReviewEngine(config)
+
+        feedbacks = [
+            ReviewerFeedback(
+                reviewer_name="R1",
+                issues=[
+                    ReviewIssue(severity="minor", content="Typo")
+                ],
+            )
+        ]
+
+        formatted = engine._format_issues_for_author(feedbacks)
+        assert "why:" not in formatted
+        assert "pattern:" not in formatted
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_format_verdicts_includes_why_pattern(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+        from review_loop.models import (
+            AuthorVerdictItem,
+            ReviewerFeedback,
+            ReviewIssue,
+        )
+
+        config = _make_config(num_reviewers=1)
+        engine = ReviewEngine(config)
+
+        feedbacks = [
+            ReviewerFeedback(
+                reviewer_name="R1",
+                issues=[
+                    ReviewIssue(
+                        severity="major",
+                        content="Bad logic",
+                        why="Premise unsupported",
+                        pattern="Check causal chains",
+                    )
+                ],
+            )
+        ]
+        verdicts = [
+            AuthorVerdictItem(
+                reviewer="R1", issue_index=0,
+                verdict="accept", reason="Will fix",
+            )
+        ]
+
+        formatted = engine._format_verdicts_for_author(verdicts, feedbacks)
+        assert "why: Premise unsupported" in formatted
+        assert "pattern: Check causal chains" in formatted
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_build_reviewer_context_includes_why_pattern(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+        from review_loop.models import (
+            AuthorVerdictItem,
+            ReviewerFeedback,
+            ReviewIssue,
+        )
+
+        config = _make_config(num_reviewers=1)
+        engine = ReviewEngine(config)
+
+        feedbacks = [
+            ReviewerFeedback(
+                reviewer_name="Reviewer-A",
+                issues=[
+                    ReviewIssue(
+                        severity="critical",
+                        content="Flaw",
+                        why="Violates X",
+                        pattern="Check Y",
+                    )
+                ],
+            )
+        ]
+        verdicts = [
+            AuthorVerdictItem(
+                reviewer="Reviewer-A", issue_index=0,
+                verdict="reject", reason="Disagree",
+            )
+        ]
+
+        ctx = engine._build_reviewer_context(feedbacks, verdicts)
+        assert "Reviewer-A" in ctx
+        assert "why: Violates X" in ctx["Reviewer-A"]
+        assert "pattern: Check Y" in ctx["Reviewer-A"]
+
+
+class TestSubmitReviewInstructionWhyPattern:
+    """Test that reviewer instruction mentions why and pattern."""
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_instruction_mentions_why_and_pattern(self, MockAgent, MockCtxMgr, mock_import):
+        from review_loop.engine import ReviewEngine
+
+        config = _make_config(num_reviewers=1)
+        ReviewEngine(config)
+
+        # The reviewer agent's system prompt should contain why/pattern mention
+        reviewer_call = MockAgent.call_args_list[-1]
+        system_msg = reviewer_call.kwargs.get("system_message", "")
+        assert "why" in system_msg
+        assert "pattern" in system_msg

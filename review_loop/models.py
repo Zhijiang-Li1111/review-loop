@@ -9,6 +9,8 @@ from dataclasses import dataclass
 class ReviewIssue:
     severity: str  # "critical" | "major" | "minor"
     content: str
+    why: str = ""  # 为什么是问题，违反了什么原则/会导致什么后果
+    pattern: str = ""  # 同类问题提示，建议检查全文哪些地方有类似模式
 
 
 @dataclass

@@ -18,10 +18,43 @@ class TestReviewIssue:
         assert issue.severity == "critical"
         assert issue.content == "Missing logic step"
 
+    def test_why_pattern_defaults(self):
+        """why and pattern default to empty string (backward compatible)."""
+        issue = ReviewIssue(severity="minor", content="Typo")
+        assert issue.why == ""
+        assert issue.pattern == ""
+
+    def test_why_pattern_explicit(self):
+        """why and pattern can be set explicitly."""
+        issue = ReviewIssue(
+            severity="major",
+            content="Missing data source",
+            why="Violates evidence-based principle; readers cannot verify the claim",
+            pattern="Check all statistical claims for source attribution",
+        )
+        assert issue.why == "Violates evidence-based principle; readers cannot verify the claim"
+        assert issue.pattern == "Check all statistical claims for source attribution"
+
     def test_asdict(self):
         issue = ReviewIssue(severity="minor", content="Typo")
         d = dataclasses.asdict(issue)
-        assert d == {"severity": "minor", "content": "Typo"}
+        assert d == {"severity": "minor", "content": "Typo", "why": "", "pattern": ""}
+
+    def test_asdict_with_why_pattern(self):
+        """asdict includes why and pattern when set."""
+        issue = ReviewIssue(
+            severity="critical",
+            content="Gap",
+            why="Breaks logical chain",
+            pattern="Check all causal arguments",
+        )
+        d = dataclasses.asdict(issue)
+        assert d == {
+            "severity": "critical",
+            "content": "Gap",
+            "why": "Breaks logical chain",
+            "pattern": "Check all causal arguments",
+        }
 
 
 class TestReviewerFeedback:
