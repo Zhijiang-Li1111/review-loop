@@ -413,6 +413,7 @@ class ReviewEngine:
         self,
         content: str,
         per_reviewer_ctx: dict[str, str],
+        guidance: str | None = None,
     ) -> list[ReviewerFeedback]:
         """All reviewers audit content in parallel."""
 
@@ -430,6 +431,8 @@ class ReviewEngine:
                     f"以下是需要审核的内容：\n\n{content}\n\n"
                     f"请仔细审核上述内容，找出其中的问题。"
                 )
+            if guidance:
+                prompt = f"📋 主编指导意见（供审核参考）：{guidance}\n\n" + prompt
 
             # Use full RunOutput to inspect tool calls
             run_output = await self._safe_agent_call_full(reviewer, prompt)
@@ -511,6 +514,7 @@ class ReviewEngine:
         self,
         content: str,
         feedbacks: list[ReviewerFeedback],
+        guidance: str | None = None,
     ) -> list[AuthorVerdictItem]:
         """Author evaluates each issue and outputs per-issue verdicts.
 
@@ -519,7 +523,14 @@ class ReviewEngine:
         parsing from the text response.
         """
         issues_text = self._format_issues_for_author(feedbacks)
+        guidance_prefix = ""
+        if guidance:
+            guidance_prefix = (
+                f"⚠️ 主编指导意见：{guidance}\n"
+                f"请在本轮修改中优先响应以上指导意见。\n\n"
+            )
         prompt = (
+            f"{guidance_prefix}"
             f"{self._config.author.receiving_review_prompt}\n\n"
             f"当前内容：\n\n{content}\n\n"
             f"审核员反馈：\n\n{issues_text}"
@@ -709,6 +720,55 @@ class ReviewEngine:
         return ctx
 
     # ------------------------------------------------------------------
+    # Rebuild reviewer context from archived history
+    # ------------------------------------------------------------------
+
+    def _rebuild_reviewer_ctx_from_history(
+        self,
+        last_round: dict,
+    ) -> dict[str, str]:
+        """Rebuild per-reviewer context from the last archived round.
+
+        Converts raw archived dicts back into the same context format that
+        _build_reviewer_context produces, so reviewers see their prior
+        issues and the Author's verdicts on resume.
+        """
+        feedbacks_raw = last_round.get("reviewer_feedbacks", {})
+        verdict_raw = last_round.get("verdict") or []
+
+        # Build verdict map: (reviewer, issue_index) -> verdict dict
+        verdict_map: dict[tuple[str, int], dict] = {}
+        for v in verdict_raw:
+            if isinstance(v, dict):
+                key = (v.get("reviewer", ""), v.get("issue_index", 0))
+                verdict_map[key] = v
+
+        ctx: dict[str, str] = {}
+        for reviewer_name, fb_data in feedbacks_raw.items():
+            issues = fb_data.get("issues", []) if isinstance(fb_data, dict) else []
+            if not issues:
+                continue
+            parts: list[str] = ["[上一轮你提出的 issues 及 Author 的回应]"]
+            for i, issue in enumerate(issues):
+                sev = issue.get("severity", "minor") if isinstance(issue, dict) else "minor"
+                content = issue.get("content", "") if isinstance(issue, dict) else ""
+                parts.append(f"\nissue {i} ({sev}): {content}")
+                if isinstance(issue, dict):
+                    if issue.get("why"):
+                        parts.append(f"    why: {issue['why']}")
+                    if issue.get("pattern"):
+                        parts.append(f"    pattern: {issue['pattern']}")
+                v = verdict_map.get((reviewer_name, i))
+                if v:
+                    tag = v.get("verdict", "unclear").upper()
+                    parts.append(f"Author 回应: [{tag}] {v.get('reason', '')}")
+                else:
+                    parts.append("Author 回应: [未回应]")
+            ctx[reviewer_name] = "\n".join(parts)
+
+        return ctx
+
+    # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
@@ -716,21 +776,51 @@ class ReviewEngine:
         self,
         initial_content: str | None = None,
         context: str | None = None,
+        resume_path: str | None = None,
+        extra_rounds: int | None = None,
+        guidance: str | None = None,
     ) -> ReviewResult:
         """Run the full write-review loop."""
-        session_path = self._archiver.start_session(self._config)
 
-        # Build or load context
-        if context is not None:
-            ctx = context
+        # Resume mode: reload existing session
+        if resume_path is not None:
+            if not extra_rounds or extra_rounds < 1:
+                raise ValueError(
+                    "extra_rounds must be a positive integer when resuming"
+                )
+            session_path = self._archiver.resume_session(resume_path)
+            history = self._archiver.load_history()
+            if not history:
+                raise ValueError(
+                    "No rounds found in archive; nothing to resume from"
+                )
+            start_round = len(history) + 1
+            max_rounds = len(history) + extra_rounds
+
+            # Rebuild state: latest author content
+            last = history[-1]
+            content = last["author_content"]
+            # If last round had a response with updated_content, use that
+            if last.get("response") and last["response"].get("updated_content"):
+                content = last["response"]["updated_content"]
+
+            # Rebuild per_reviewer_ctx from last round's feedbacks and verdicts
+            per_reviewer_ctx = self._rebuild_reviewer_ctx_from_history(last)
+
         else:
-            ctx = await self._context_mgr.build_initial_context()
-        self._archiver.save_context(ctx)
+            # Fresh start
+            session_path = self._archiver.start_session(self._config)
 
-        rounds_completed: int = 0
-        per_reviewer_ctx: dict[str, str] = {}
+            # Build or load context
+            if context is not None:
+                ctx = context
+            else:
+                ctx = await self._context_mgr.build_initial_context()
+            self._archiver.save_context(ctx)
 
-        try:
+            start_round = 1
+            max_rounds = self._config.max_rounds
+
             # Get initial content
             if initial_content is not None:
                 content = initial_content
@@ -739,9 +829,14 @@ class ReviewEngine:
 
             self._archiver.save_author_content(1, content)
 
-            for round_num in range(1, self._config.max_rounds + 1):
+            per_reviewer_ctx: dict[str, str] = {}
+
+        rounds_completed: int = 0
+
+        try:
+            for round_num in range(start_round, max_rounds + 1):
                 # Reviewers audit in parallel
-                feedbacks = await self._review(content, per_reviewer_ctx)
+                feedbacks = await self._review(content, per_reviewer_ctx, guidance=guidance)
 
                 for fb in feedbacks:
                     self._archiver.save_reviewer_feedback(
@@ -762,7 +857,7 @@ class ReviewEngine:
                     )
 
                 # Author evaluates feedback (verdict only)
-                verdicts = await self._author_evaluate_feedback(content, feedbacks)
+                verdicts = await self._author_evaluate_feedback(content, feedbacks, guidance=guidance)
 
                 self._archiver.save_author_verdict(
                     round_num,
@@ -798,7 +893,7 @@ class ReviewEngine:
 
             return ReviewResult(
                 converged=False,
-                rounds_completed=self._config.max_rounds,
+                rounds_completed=max_rounds,
                 archive_path=session_path,
                 final_content=content,
                 unresolved_issues=unresolved,

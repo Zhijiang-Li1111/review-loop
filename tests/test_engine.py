@@ -826,7 +826,7 @@ class TestMainLoop:
 
         round_counter = {"n": 0}
 
-        async def mock_review(content, per_reviewer_ctx):
+        async def mock_review(content, per_reviewer_ctx, **kwargs):
             round_counter["n"] += 1
             if round_counter["n"] == 1:
                 return [
@@ -950,7 +950,7 @@ class TestMainLoop:
         # Round 1: issue found, round 2: no issues
         round_counter = {"n": 0}
 
-        async def mock_review(content, ctx):
+        async def mock_review(content, ctx, **kwargs):
             round_counter["n"] += 1
             if round_counter["n"] == 1:
                 return [ReviewerFeedback(

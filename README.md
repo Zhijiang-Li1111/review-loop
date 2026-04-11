@@ -213,7 +213,9 @@ Example:
 ## CLI Usage
 
 ```
-usage: python -m review_loop [-h] [--input INPUT] [--context CONTEXT] config
+usage: python -m review_loop [-h] [--input INPUT] [--context CONTEXT]
+                              [--resume RESUME] [--rounds ROUNDS]
+                              [--guidance GUIDANCE] config
 
 positional arguments:
   config             Path to YAML configuration file
@@ -222,6 +224,9 @@ options:
   -h, --help         show this help message and exit
   --input INPUT      Path to initial content file (skip Author generation)
   --context CONTEXT  Path to context file (override context builder)
+  --resume RESUME    Path to existing review archive to resume from
+  --rounds ROUNDS    Number of additional rounds to run (used with --resume)
+  --guidance GUIDANCE  Editor guidance injected into Author and Reviewer prompts
 ```
 
 ### Examples
@@ -239,6 +244,47 @@ python -m review_loop config.yaml --context research_notes.md
 # Combine both: review existing content with additional context
 python -m review_loop config.yaml --input draft.md --context notes.md
 ```
+
+### Resume — Continue a Previous Session
+
+Resume an existing review session and run additional rounds. New rounds append to the same archive directory.
+
+```bash
+# Resume from a previous session, run 2 more rounds
+python -m review_loop config.yaml --resume output/2026-04-11_1645 --rounds 2
+```
+
+- `--resume <path>` points to an existing archive directory (e.g., `output/2026-04-11_1645`)
+- `--rounds <n>` specifies how many additional rounds to run (required with `--resume`)
+- Round numbering continues from where the previous session left off
+- Context is loaded from the archive (not regenerated)
+- The latest author content is reconstructed from the saved rounds
+
+### Guidance — Editor Direction
+
+Inject editor guidance into both Author and Reviewer prompts. The Author sees it as a priority directive; Reviewers see it as an auditing reference.
+
+```bash
+# Guidance with a fresh run
+python -m review_loop config.yaml --guidance '请特别注意数据准确性'
+
+# Guidance with resume
+python -m review_loop config.yaml --resume output/2026-04-11_1645 --rounds 1 \
+  --guidance '用 DeepSeek V4 做开篇叙事线索'
+```
+
+The Author prompt receives:
+```
+⚠️ 主编指导意见：{guidance}
+请在本轮修改中优先响应以上指导意见。
+```
+
+Each Reviewer prompt receives:
+```
+📋 主编指导意见（供审核参考）：{guidance}
+```
+
+When `--guidance` is not provided, no injection occurs.
 
 ### Output
 
@@ -327,7 +373,8 @@ review-loop/
 │   ├── test_main.py
 │   ├── test_models.py
 │   ├── test_persistence.py
-│   └── test_registry.py
+│   ├── test_registry.py
+│   └── test_resume.py
 ├── configs/
 │   └── outline_review.yaml  # Example configuration
 ├── pyproject.toml

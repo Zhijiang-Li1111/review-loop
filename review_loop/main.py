@@ -18,10 +18,31 @@ def main() -> None:
     parser.add_argument("config", help="Path to YAML configuration file")
     parser.add_argument("--input", help="Path to initial content file")
     parser.add_argument("--context", help="Path to context file")
+    parser.add_argument(
+        "--resume",
+        help="Path to existing review archive to resume from",
+    )
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        help="Number of additional rounds to run (used with --resume)",
+    )
+    parser.add_argument(
+        "--guidance",
+        help="Editor guidance injected into Author and Reviewer prompts",
+    )
     args = parser.parse_args()
 
     if not os.path.isfile(args.config):
         print(f"Error: config file not found: {args.config}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.resume and not args.rounds:
+        print("Error: --rounds is required when using --resume", file=sys.stderr)
+        sys.exit(1)
+
+    if args.rounds and not args.resume:
+        print("Error: --rounds can only be used with --resume", file=sys.stderr)
         sys.exit(1)
 
     config = ConfigLoader.load(args.config)
@@ -36,6 +57,13 @@ def main() -> None:
     if args.context:
         with open(args.context, "r", encoding="utf-8") as f:
             run_kwargs["context"] = f.read()
+
+    if args.resume:
+        run_kwargs["resume_path"] = args.resume
+        run_kwargs["extra_rounds"] = args.rounds
+
+    if args.guidance:
+        run_kwargs["guidance"] = args.guidance
 
     result = asyncio.run(engine.run(**run_kwargs))
 

@@ -72,3 +72,88 @@ class Archiver:
     def save_error_log(self, error: str) -> None:
         path = Path(self._session_dir) / "error.log"
         path.write_text(f"Review terminated by error:\n{error}\n")
+
+    # ------------------------------------------------------------------
+    # Resume support
+    # ------------------------------------------------------------------
+
+    def resume_session(self, archive_path: str) -> str:
+        """Point at an existing archive directory for appending new rounds."""
+        session_path = Path(archive_path).resolve()
+        if not session_path.is_dir():
+            raise FileNotFoundError(f"Archive directory not found: {archive_path}")
+        rounds_path = session_path / "rounds"
+        if not rounds_path.is_dir():
+            raise FileNotFoundError(
+                f"rounds/ subdirectory not found in: {archive_path}"
+            )
+        self._session_dir = str(session_path)
+        return self._session_dir
+
+    def load_history(self) -> list[dict]:
+        """Load round history from the current session's rounds/ directory.
+
+        Returns a list of dicts (one per round) with keys:
+        ``author_content``, ``reviewer_feedbacks``, ``verdict``, ``response``.
+        Only includes complete rounds (those with reviewer feedback files).
+        """
+        rounds_dir = Path(self._session_dir) / "rounds"
+
+        # Discover round numbers from author files
+        round_nums: set[int] = set()
+        for f in rounds_dir.iterdir():
+            if f.name.startswith("round_") and f.name.endswith("_author.md"):
+                try:
+                    num = int(f.name.split("_")[1])
+                except ValueError:
+                    continue
+                round_nums.add(num)
+
+        history: list[dict] = []
+        for rn in sorted(round_nums):
+            author_file = rounds_dir / f"round_{rn}_author.md"
+
+            # Check if this round has any reviewer feedback
+            reviewer_files = list(rounds_dir.glob(f"round_{rn}_reviewer_*.json"))
+            if not reviewer_files:
+                # Incomplete round (e.g., the N+1 author file written after
+                # the last completed round) — skip it.
+                continue
+
+            record: dict = {
+                "round_num": rn,
+                "author_content": author_file.read_text(),
+                "reviewer_feedbacks": {},
+                "verdict": None,
+                "response": None,
+            }
+
+            # Load reviewer feedbacks
+            for f in rounds_dir.glob(f"round_{rn}_reviewer_*.json"):
+                # Extract reviewer name from filename
+                prefix = f"round_{rn}_reviewer_"
+                name = f.name[len(prefix):-len(".json")]
+                record["reviewer_feedbacks"][name] = json.loads(f.read_text())
+
+            # Load verdict
+            verdict_file = rounds_dir / f"round_{rn}_author_verdict.json"
+            if verdict_file.exists():
+                record["verdict"] = json.loads(verdict_file.read_text())
+
+            # Load response
+            response_file = rounds_dir / f"round_{rn}_author_response.json"
+            if response_file.exists():
+                record["response"] = json.loads(response_file.read_text())
+
+            history.append(record)
+
+        return history
+
+    def load_context(self) -> str:
+        """Read context.md from the current session directory."""
+        ctx_path = Path(self._session_dir) / "context.md"
+        if not ctx_path.exists():
+            raise FileNotFoundError(
+                f"context.md not found in: {self._session_dir}"
+            )
+        return ctx_path.read_text()
