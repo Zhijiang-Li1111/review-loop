@@ -11,6 +11,7 @@ from review_loop.config import (
     ReviewerConfig,
     ToolConfig,
     resolve_env,
+    _resolve_template_vars,
 )
 
 
@@ -262,3 +263,72 @@ class TestAuthorInitialPrompt:
         path.write_text(yaml.dump(d, allow_unicode=True))
         cfg = ConfigLoader.load(str(path))
         assert cfg.author.initial_prompt == "请基于以上选题讨论结论，生成一份完整的文章大纲。"
+
+
+class TestResolveTemplateVars:
+    """Tests for {{var}} template variable resolution."""
+
+    def test_top_level_string_replaces_in_reviewer_prompt(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["reader_persona"] = "程序员，26-35岁"
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "读者是{{reader_persona}}。"},
+        ]
+        path = tmp_path / "tpl.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.reviewers[0].system_prompt == "读者是程序员，26-35岁。"
+
+    def test_top_level_string_replaces_in_author_prompt(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["greeting"] = "Hello World"
+        d["author"]["system_prompt"] = "Prompt: {{greeting}}"
+        path = tmp_path / "tpl2.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.author.system_prompt == "Prompt: Hello World"
+
+    def test_multiple_vars_replaced(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["var_a"] = "AAA"
+        d["var_b"] = "BBB"
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "{{var_a}} and {{var_b}}"},
+        ]
+        path = tmp_path / "multi.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert cfg.reviewers[0].system_prompt == "AAA and BBB"
+
+    def test_unknown_placeholder_left_as_is(self, tmp_path, sample_config_dict):
+        d = dict(sample_config_dict)
+        d["reviewers"] = [
+            {"name": "R1", "system_prompt": "Keep {{unknown_var}} intact."},
+        ]
+        path = tmp_path / "unknown.yaml"
+        path.write_text(yaml.dump(d, allow_unicode=True))
+        cfg = ConfigLoader.load(str(path))
+        assert "{{unknown_var}}" in cfg.reviewers[0].system_prompt
+
+    def test_reserved_keys_not_used_as_vars(self):
+        raw = {
+            "review": {"model": "m"},
+            "author": {"name": "A", "system_prompt": "Use {{review}}"},
+            "reviewers": [{"name": "R", "system_prompt": "ok"}],
+        }
+        _resolve_template_vars(raw)
+        assert raw["author"]["system_prompt"] == "Use {{review}}"
+
+    def test_non_string_top_level_ignored(self):
+        raw = {
+            "review": {"model": "m"},
+            "author": {"name": "A", "system_prompt": "{{num}}"},
+            "reviewers": [{"name": "R", "system_prompt": "ok"}],
+            "num": 42,
+        }
+        _resolve_template_vars(raw)
+        assert raw["author"]["system_prompt"] == "{{num}}"
+
+    def test_no_vars_is_noop(self, sample_config_yaml):
+        cfg = ConfigLoader.load(sample_config_yaml)
+        assert cfg.reviewers[0].system_prompt == "Check logic."

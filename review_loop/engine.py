@@ -140,15 +140,6 @@ class ReviewEngine:
             add_history_to_context=False,
         )
 
-        # Expand template variables in reviewer system prompts
-        template_vars = {
-            "{{author.system_prompt}}": config.author.system_prompt,
-        }
-        for rc in config.reviewers:
-            for placeholder, value in template_vars.items():
-                if placeholder in rc.system_prompt:
-                    rc.system_prompt = rc.system_prompt.replace(placeholder, value)
-
         # Create Reviewer agents with submit_review tool (+ optional per-reviewer tools)
         self._reviewers: list[Agent] = []
         for rc in config.reviewers:
