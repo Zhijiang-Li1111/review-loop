@@ -6,12 +6,15 @@ import asyncio
 import json
 import logging
 import re
+import time as _time
 from dataclasses import asdict
 from pydantic import BaseModel, Field
 
 from agno.agent import Agent
+from agno.skills import Skills
+from agno.skills.loaders.local import LocalSkills
 
-from review_loop.config import ReviewConfig, build_claude
+from review_loop.config import ReviewConfig, SkillConfig, build_claude
 from review_loop.context import ContextManager
 from review_loop.models import (
     AuthorResponse,
@@ -20,6 +23,7 @@ from review_loop.models import (
     ReviewIssue,
     ReviewResult,
 )
+from review_loop.audit import AuditLogger, generate_usage_summary
 from review_loop.persistence import Archiver
 from review_loop.registry import import_from_path
 from review_loop.tools import submit_review, submit_revision, submit_verdict
@@ -39,6 +43,25 @@ class ReviewerOutput(BaseModel):
     issues: list[ReviewIssueOutput] = Field(default_factory=list, description="List of issues found. Empty list means no issues.")
 
 logger = logging.getLogger(__name__)
+
+
+def _build_skills(
+    global_skills: list[SkillConfig] | None,
+    local_skills: list[SkillConfig] | None,
+) -> Skills | None:
+    """Build an agno Skills object from global + per-agent skill configs.
+
+    Returns None if no skills are configured.
+    """
+    all_configs: list[SkillConfig] = []
+    if global_skills:
+        all_configs.extend(global_skills)
+    if local_skills:
+        all_configs.extend(local_skills)
+    if not all_configs:
+        return None
+    loaders = [LocalSkills(path=sc.path, validate=False) for sc in all_configs]
+    return Skills(loaders=loaders)
 
 # Instruction appended to every reviewer's system prompt to ensure
 # they call the submit_review tool with structured output.
@@ -98,6 +121,7 @@ class ReviewEngine:
     def __init__(self, config: ReviewConfig):
         self._config = config
         self._archiver = Archiver()
+        self._audit: AuditLogger | None = None
 
         # Import tool classes for Author
         tool_instances = []
@@ -114,6 +138,9 @@ class ReviewEngine:
 
         model = build_claude(config.model_config)
 
+        # Load skills for author
+        author_skills = _build_skills(config.skills, config.author.skills)
+
         # Create Author verdict agent (external tools + submit_verdict)
         verdict_tools = list(tool_instances) if tool_instances else []
         verdict_tools.append(submit_verdict)
@@ -123,6 +150,7 @@ class ReviewEngine:
             model=model,
             system_message=config.author.system_prompt,
             tools=verdict_tools,
+            skills=author_skills,
             store_tool_messages=False,
             add_history_to_context=False,
         )
@@ -136,6 +164,7 @@ class ReviewEngine:
             model=model,
             system_message=config.author.system_prompt,
             tools=revision_tools,
+            skills=author_skills,
             store_tool_messages=False,
             add_history_to_context=False,
         )
@@ -153,11 +182,15 @@ class ReviewEngine:
             # Append submit_review instruction to system prompt
             reviewer_system_prompt = rc.system_prompt + _SUBMIT_REVIEW_INSTRUCTION
 
+            # Load skills for this reviewer (global + per-reviewer)
+            reviewer_skills = _build_skills(config.skills, rc.skills)
+
             reviewer = Agent(
                 name=rc.name,
                 model=model,
                 system_message=reviewer_system_prompt,
                 tools=reviewer_tools,
+                skills=reviewer_skills,
                 store_tool_messages=False,
                 add_history_to_context=False,
             )
@@ -168,19 +201,37 @@ class ReviewEngine:
     # ------------------------------------------------------------------
 
     async def _safe_agent_call(self, agent: Agent, prompt: str) -> str | None:
+        if self._audit:
+            start_extras = AuditLogger.extract_call_start_extras(agent)
+            self._audit.log_call_start(agent.name, prompt, **start_extras)
+        t0 = _time.monotonic()
         for attempt in range(2):
             try:
                 result = await agent.arun(input=prompt, stream=False)
                 if result.content:
+                    elapsed = (_time.monotonic() - t0) * 1000
+                    if self._audit:
+                        self._audit.log_from_run_output(agent.name, result)
+                        end_extras = AuditLogger.extract_call_end_extras(result)
+                        self._audit.log_call_end(agent.name, elapsed, result.content, "end_turn", **end_extras)
                     return result.content
                 if attempt == 0:
                     continue
+                elapsed = (_time.monotonic() - t0) * 1000
+                if self._audit:
+                    self._audit.log_call_end(agent.name, elapsed, None, "empty_content")
                 return None
-            except Exception:
+            except Exception as exc:
                 if attempt == 0:
                     continue
+                elapsed = (_time.monotonic() - t0) * 1000
                 logger.warning("Agent '%s' failed after 2 attempts", agent.name, exc_info=True)
+                if self._audit:
+                    self._audit.log_error(agent.name, str(exc), elapsed)
                 return None
+        elapsed = (_time.monotonic() - t0) * 1000
+        if self._audit:
+            self._audit.log_call_end(agent.name, elapsed, None, "exhausted_retries")
         return None
 
     async def _safe_agent_call_full(self, agent: Agent, prompt: str):
@@ -189,19 +240,42 @@ class ReviewEngine:
         Used for reviewer calls where we need to inspect tool calls.
         Returns None on failure.
         """
+        if self._audit:
+            start_extras = AuditLogger.extract_call_start_extras(agent)
+            self._audit.log_call_start(agent.name, prompt, **start_extras)
+        t0 = _time.monotonic()
         for attempt in range(2):
             try:
                 result = await agent.arun(input=prompt, stream=False)
                 if result.content is not None or result.tools:
+                    elapsed = (_time.monotonic() - t0) * 1000
+                    if self._audit:
+                        self._audit.log_from_run_output(agent.name, result)
+                        end_extras = AuditLogger.extract_call_end_extras(result)
+                        self._audit.log_call_end(
+                            agent.name, elapsed,
+                            result.content if result.content else None,
+                            "end_turn",
+                            **end_extras,
+                        )
                     return result
                 if attempt == 0:
                     continue
+                elapsed = (_time.monotonic() - t0) * 1000
+                if self._audit:
+                    self._audit.log_call_end(agent.name, elapsed, None, "empty_content")
                 return None
-            except Exception:
+            except Exception as exc:
                 if attempt == 0:
                     continue
+                elapsed = (_time.monotonic() - t0) * 1000
                 logger.warning("Agent '%s' failed after 2 attempts", agent.name, exc_info=True)
+                if self._audit:
+                    self._audit.log_error(agent.name, str(exc), elapsed)
                 return None
+        elapsed = (_time.monotonic() - t0) * 1000
+        if self._audit:
+            self._audit.log_call_end(agent.name, elapsed, None, "exhausted_retries")
         return None
 
     # ------------------------------------------------------------------
@@ -780,6 +854,7 @@ class ReviewEngine:
                     "extra_rounds must be a positive integer when resuming"
                 )
             session_path = self._archiver.resume_session(resume_path)
+            self._audit = AuditLogger(session_path)
             history = self._archiver.load_history()
             if not history:
                 raise ValueError(
@@ -801,6 +876,7 @@ class ReviewEngine:
         else:
             # Fresh start
             session_path = self._archiver.start_session(self._config)
+            self._audit = AuditLogger(session_path)
 
             # Build or load context
             if context is not None:
@@ -900,3 +976,16 @@ class ReviewEngine:
                 unresolved_issues=[],
                 terminated_by_error=True,
             )
+
+        finally:
+            if self._audit:
+                self._audit.close()
+            # Generate usage summary after all rounds complete
+            try:
+                generate_usage_summary(
+                    session_path,
+                    model_name=self._config.model_config.model,
+                    total_rounds=rounds_completed,
+                )
+            except Exception:
+                logger.warning("Failed to generate usage summary", exc_info=True)

@@ -1,5 +1,6 @@
 """review-loop — generic write-review loop framework."""
 
+from review_loop.audit import generate_usage_summary
 from review_loop.config import (
     AuthorConfig,
     ConfigLoader,
@@ -38,6 +39,7 @@ __all__ = [
     "RoundRecord",
     "ToolConfig",
     "build_claude",
+    "generate_usage_summary",
     "import_from_path",
     "resolve_env",
     "submit_review",

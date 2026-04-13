@@ -20,6 +20,7 @@ _TEMPLATE_RE = re.compile(r"\{\{(\w+)\}\}")
 # Keys consumed by the framework — never treated as template variables.
 _RESERVED_KEYS = frozenset({
     "review", "author", "reviewers", "tools", "context", "context_builder",
+    "skills",
 })
 
 
@@ -113,6 +114,12 @@ class ToolConfig:
     path: str
 
 
+@dataclass
+class SkillConfig:
+    """Reference to a skill directory path."""
+    path: str
+
+
 _DEFAULT_INITIAL_PROMPT = "请基于上述背景资料，生成初始内容。"
 
 
@@ -122,6 +129,7 @@ class AuthorConfig:
     system_prompt: str
     receiving_review_prompt: str
     initial_prompt: str = _DEFAULT_INITIAL_PROMPT
+    skills: list[SkillConfig] | None = None
 
 
 @dataclass
@@ -129,6 +137,7 @@ class ReviewerConfig:
     name: str
     system_prompt: str
     tools: list[ToolConfig] | None = None
+    skills: list[SkillConfig] | None = None
 
 
 @dataclass
@@ -140,6 +149,7 @@ class ReviewConfig:
     tools: list[ToolConfig]
     context: dict
     context_builder: str | None = None
+    skills: list[SkillConfig] | None = None
 
 
 _REQUIRED_TOP_KEYS = ("review", "author", "reviewers")
@@ -179,11 +189,23 @@ class ConfigLoader:
 
         # --- author ---
         author_raw = raw["author"]
+        author_skills: list[SkillConfig] | None = None
+        raw_author_skills = author_raw.get("skills")
+        if raw_author_skills:
+            author_skills = []
+            for i, s in enumerate(raw_author_skills):
+                if not isinstance(s, dict) or "path" not in s:
+                    raise ValueError(
+                        f"author.skills[{i}]: each skill must be a dict with "
+                        f"a 'path' key, got {s!r}"
+                    )
+                author_skills.append(SkillConfig(path=s["path"]))
         author = AuthorConfig(
             name=author_raw["name"],
             system_prompt=author_raw["system_prompt"],
             receiving_review_prompt=author_raw.get("receiving_review_prompt", ""),
             initial_prompt=author_raw.get("initial_prompt", _DEFAULT_INITIAL_PROMPT),
+            skills=author_skills,
         )
 
         # --- reviewers ---
@@ -200,11 +222,23 @@ class ConfigLoader:
                             f"each tool must be a dict with a 'path' key, got {rt!r}"
                         )
                     reviewer_tools.append(ToolConfig(path=rt["path"]))
+            reviewer_skills: list[SkillConfig] | None = None
+            raw_reviewer_skills = r.get("skills")
+            if raw_reviewer_skills:
+                reviewer_skills = []
+                for j, rs in enumerate(raw_reviewer_skills):
+                    if not isinstance(rs, dict) or "path" not in rs:
+                        raise ValueError(
+                            f"reviewers['{r.get('name', '?')}'].skills[{j}]: "
+                            f"each skill must be a dict with a 'path' key, got {rs!r}"
+                        )
+                    reviewer_skills.append(SkillConfig(path=rs["path"]))
             reviewers.append(
                 ReviewerConfig(
                     name=r["name"],
                     system_prompt=r["system_prompt"],
                     tools=reviewer_tools,
+                    skills=reviewer_skills,
                 )
             )
         if not reviewers:
@@ -227,6 +261,17 @@ class ConfigLoader:
         # --- context_builder (optional) ---
         context_builder: str | None = raw.get("context_builder")
 
+        # --- skills (optional, global skills shared by all agents) ---
+        raw_skills = raw.get("skills") or []
+        skills: list[SkillConfig] = []
+        for i, entry in enumerate(raw_skills):
+            if not isinstance(entry, dict) or "path" not in entry:
+                raise ValueError(
+                    f"skills[{i}]: each skill must be a dict with a 'path' key, "
+                    f"got {entry!r}"
+                )
+            skills.append(SkillConfig(path=entry["path"]))
+
         return ReviewConfig(
             max_rounds=max_rounds,
             model_config=model_config,
@@ -235,4 +280,5 @@ class ConfigLoader:
             tools=tools,
             context=context,
             context_builder=context_builder,
+            skills=skills if skills else None,
         )
