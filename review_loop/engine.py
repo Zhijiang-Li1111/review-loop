@@ -97,6 +97,23 @@ class AllReviewersFailedError(Exception):
     """Raised when every reviewer fails during a review step."""
 
 
+def _verdict_hint(verdict: str | None) -> str:
+    """Return a short verification hint based on verdict type.
+
+    Used by both _build_reviewer_context and _rebuild_reviewer_ctx_from_history
+    to produce consistent hints.
+    """
+    if verdict == "accept":
+        return "→ 请在当前内容中定位相关段落，核实此修改是否到位且合理。"
+    elif verdict == "reject":
+        return "→ Author 拒绝修改。请在当前内容中核实 Author 的理由是否成立。"
+    elif verdict == "unclear":
+        return "→ Author 回应不明确，请以当前内容为准独立判断。"
+    else:
+        # None or missing — Author didn't respond
+        return "→ Author 未回应此 issue，请在当前内容中检查是否仍然存在。"
+
+
 class ReviewEngine:
     """Run a structured write-review loop to convergence or max rounds."""
 
@@ -487,9 +504,11 @@ class ReviewEngine:
             if prev_ctx:
                 prompt = (
                     f"{prev_ctx}\n\n"
-                    f"以下是修改后的内容：\n\n{content}\n\n"
+                    f"---\n⚠️ 以下为【当前内容】，是本轮审核的唯一判断依据。上方引用的原文片段仅供定位参考，issue 列表和 Author 回应仍需重点关注。\n---\n\n"
+                    f"{content}\n\n"
                     f"请审核修改后的内容。对于 Author 接受并修改的 issue，检查修改是否真正解决了问题。"
-                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。"
+                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。\n\n"
+                    f"注意：以上方【当前内容】为唯一判断依据。"
                 )
             else:
                 prompt = (
@@ -778,8 +797,10 @@ class ReviewEngine:
                 if verdict_item:
                     tag = verdict_item.verdict.upper()
                     parts.append(f"Author 回应: [{tag}] {verdict_item.reason}")
+                    parts.append(_verdict_hint(verdict_item.verdict))
                 else:
                     parts.append(f"Author 回应: [未回应]")
+                    parts.append(_verdict_hint(None))
             ctx[fb.reviewer_name] = "\n".join(parts)
 
         return ctx
@@ -827,8 +848,10 @@ class ReviewEngine:
                 if v:
                     tag = v.get("verdict", "unclear").upper()
                     parts.append(f"Author 回应: [{tag}] {v.get('reason', '')}")
+                    parts.append(_verdict_hint(v.get("verdict", "unclear")))
                 else:
                     parts.append("Author 回应: [未回应]")
+                    parts.append(_verdict_hint(None))
             ctx[reviewer_name] = "\n".join(parts)
 
         return ctx
