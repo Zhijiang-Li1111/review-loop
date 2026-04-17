@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import time as _time
+from collections.abc import Callable
 from dataclasses import asdict
 from pydantic import BaseModel, Field
 
@@ -154,12 +155,18 @@ class ReviewEngine:
         if issue.pattern:
             parts.append(f"    pattern: {issue.pattern}")
 
-    def __init__(self, config: ReviewConfig, workspace_dir: Path | None = None):
+    def __init__(
+        self,
+        config: ReviewConfig,
+        workspace_dir: Path | None = None,
+        error_callback: Callable[[str, dict], None] | None = None,
+    ):
         self._config = config
         self._archiver = Archiver()
         self._audit: AuditLogger | None = None
         self._workspace_dir: Path | None = workspace_dir
         self._file_tools_injected = False
+        self._error_callback = error_callback
 
         # Import tool classes for Author
         tool_instances = []
@@ -361,6 +368,22 @@ class ReviewEngine:
         draft_path = self._workspace_dir / "draft.md"
         draft_path.write_text(content)
 
+    def _handle_runtime_error(
+        self, error_msg: str, context: dict | None = None,
+    ) -> None:
+        """Log error, notify via callback, and raise RuntimeError."""
+        logger.error("Runtime error: %s", error_msg)
+        if self._audit:
+            self._audit.log_error("RUNTIME", error_msg, 0)
+        if self._archiver._session_dir is not None:
+            self._archiver.save_error_log(error_msg)
+        if self._error_callback:
+            try:
+                self._error_callback(error_msg, context or {})
+            except Exception:
+                logger.warning("Error callback failed", exc_info=True)
+        raise RuntimeError(error_msg)
+
     # ------------------------------------------------------------------
     # Tool call extraction
     # ------------------------------------------------------------------
@@ -558,7 +581,7 @@ class ReviewEngine:
 
         # Fallback: use the text returned by the agent
         if content is None:
-            raise AllReviewersFailedError("Author failed to generate initial content")
+            self._handle_runtime_error("Author 初始生成失败：未能生成正文")
         # Also write to workspace so reviewers can read
         self._write_draft_to_workspace(content)
         return content
@@ -580,9 +603,9 @@ class ReviewEngine:
         if self._workspace_dir is not None:
             draft_path = self._workspace_dir / "draft.md"
             if not draft_path.exists():
-                raise RuntimeError(
-                    "draft.md not found in workspace; "
-                    "cannot proceed with review"
+                self._handle_runtime_error(
+                    "draft.md 未找到，Author 可能未成功写入正文",
+                    {"workspace_dir": str(self._workspace_dir)},
                 )
 
         async def call_reviewer(reviewer: Agent) -> ReviewerFeedback | None:
@@ -637,7 +660,7 @@ class ReviewEngine:
         feedbacks = [r for r in results if r is not None]
 
         if not feedbacks:
-            raise AllReviewersFailedError("All reviewers failed during review step")
+            self._handle_runtime_error("所有审核员均失败")
 
         return feedbacks
 
@@ -1126,8 +1149,10 @@ class ReviewEngine:
                 unresolved_issues=unresolved,
             )
 
-        except AllReviewersFailedError as exc:
-            self._archiver.save_error_log(str(exc))
+        except (AllReviewersFailedError, RuntimeError) as exc:
+            # error_callback already invoked by _handle_runtime_error if applicable
+            if self._archiver._session_dir is not None:
+                self._archiver.save_error_log(str(exc))
             return ReviewResult(
                 converged=False,
                 rounds_completed=rounds_completed,

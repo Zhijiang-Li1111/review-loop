@@ -761,7 +761,7 @@ class TestErrorHandling:
             return None
 
         with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            with pytest.raises(AllReviewersFailedError):
+            with pytest.raises(RuntimeError, match="所有审核员均失败"):
                 await engine._review("Content", {})
 
 
@@ -2342,3 +2342,118 @@ class TestFileBasedWorkspace:
             )
 
             assert "read_file('draft.md')" in captured_prompt
+
+
+# ---------------------------------------------------------------------------
+# Error Callback
+# ---------------------------------------------------------------------------
+
+
+class TestErrorCallback:
+    def _setup_engine(self, config, error_callback=None):
+        """Create engine with all external deps mocked."""
+        from review_loop.engine import ReviewEngine
+
+        with (
+            patch("review_loop.engine.import_from_path"),
+            patch("review_loop.engine.ContextManager"),
+            patch("review_loop.engine.Agent"),
+        ):
+            engine = ReviewEngine(config, error_callback=error_callback)
+
+        engine._archiver = MagicMock()
+        engine._archiver.start_session.return_value = "/tmp/session"
+        engine._archiver._session_dir = "/tmp/session"
+        engine._context_mgr.build_initial_context = AsyncMock(return_value="ctx")
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_error_callback_called_on_all_reviewers_fail(self):
+        """error_callback should be invoked when all reviewers fail."""
+        from review_loop.engine import ReviewEngine
+
+        callback = MagicMock()
+        config = _make_config(max_rounds=10)
+        engine = self._setup_engine(config, error_callback=callback)
+
+        engine._author_generate = AsyncMock(return_value="v1")
+
+        async def mock_safe_call_full(agent, prompt):
+            return None
+
+        engine._safe_agent_call_full = AsyncMock(side_effect=mock_safe_call_full)
+        # Need real reviewers list for _review to iterate
+        r1 = MagicMock()
+        r1.name = "Reviewer-A"
+        r2 = MagicMock()
+        r2.name = "Reviewer-B"
+        engine._reviewers = [r1, r2]
+
+        result = await engine.run()
+
+        assert result.terminated_by_error is True
+        callback.assert_called_once()
+        assert "所有审核员均失败" in callback.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_no_callback_still_terminates(self):
+        """Without error_callback, errors still terminate and log."""
+        from review_loop.engine import ReviewEngine
+
+        config = _make_config(max_rounds=10)
+        engine = self._setup_engine(config, error_callback=None)
+
+        engine._author_generate = AsyncMock(return_value="v1")
+
+        engine._safe_agent_call_full = AsyncMock(return_value=None)
+        r1 = MagicMock()
+        r1.name = "Reviewer-A"
+        engine._reviewers = [r1]
+
+        result = await engine.run()
+
+        assert result.terminated_by_error is True
+        engine._archiver.save_error_log.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_does_not_block(self):
+        """If error_callback raises, _handle_runtime_error still raises RuntimeError."""
+        from review_loop.engine import ReviewEngine
+
+        def bad_callback(msg, ctx):
+            raise ValueError("callback broke")
+
+        config = _make_config(max_rounds=10)
+        engine = self._setup_engine(config, error_callback=bad_callback)
+
+        engine._author_generate = AsyncMock(return_value="v1")
+        engine._safe_agent_call_full = AsyncMock(return_value=None)
+        r1 = MagicMock()
+        r1.name = "Reviewer-A"
+        engine._reviewers = [r1]
+
+        result = await engine.run()
+
+        assert result.terminated_by_error is True
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    @pytest.mark.asyncio
+    async def test_handle_runtime_error_logs_and_raises(self, MockAgent, MockCtxMgr, mock_import):
+        """_handle_runtime_error should log, save error, call callback, and raise."""
+        from review_loop.engine import ReviewEngine
+
+        callback = MagicMock()
+        config = _make_config()
+        engine = ReviewEngine(config, error_callback=callback)
+        engine._audit = MagicMock()
+        engine._archiver = MagicMock()
+        engine._archiver._session_dir = "/tmp/session"
+
+        with pytest.raises(RuntimeError, match="test error"):
+            engine._handle_runtime_error("test error", {"key": "val"})
+
+        engine._audit.log_error.assert_called_once_with("RUNTIME", "test error", 0)
+        engine._archiver.save_error_log.assert_called_once_with("test error")
+        callback.assert_called_once_with("test error", {"key": "val"})
