@@ -743,7 +743,7 @@ class TestErrorHandling:
     @patch("review_loop.engine.ContextManager")
     @pytest.mark.asyncio
     async def test_all_reviewers_fail_raises(self, MockCtxMgr, mock_import):
-        from review_loop.engine import ReviewEngine, AllReviewersFailedError
+        from review_loop.engine import ReviewEngine
 
         mock_reviewers = [MagicMock(), MagicMock()]
         mock_reviewers[0].name = "Reviewer-A"
@@ -923,13 +923,13 @@ class TestMainLoop:
 
     @pytest.mark.asyncio
     async def test_error_termination(self):
-        from review_loop.engine import ReviewEngine, AllReviewersFailedError
+        from review_loop.engine import ReviewEngine
 
         config = _make_config(max_rounds=10)
         engine = self._setup_engine(config)
 
         engine._author_generate = AsyncMock(return_value="v1")
-        engine._review = AsyncMock(side_effect=AllReviewersFailedError("All failed"))
+        engine._review = AsyncMock(side_effect=RuntimeError("All failed"))
 
         result = await engine.run()
 

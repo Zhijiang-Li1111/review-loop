@@ -11,7 +11,7 @@ from review_loop.config import (
     build_claude,
     resolve_env,
 )
-from review_loop.engine import AllReviewersFailedError, ReviewEngine
+from review_loop.engine import ReviewEngine
 from review_loop.models import (
     AuthorResponse,
     AuthorVerdictItem,
@@ -24,7 +24,6 @@ from review_loop.registry import import_from_path
 from review_loop.tools import submit_review, submit_revision, submit_verdict
 
 __all__ = [
-    "AllReviewersFailedError",
     "AuthorConfig",
     "AuthorResponse",
     "AuthorVerdictItem",

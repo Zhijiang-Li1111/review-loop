@@ -113,9 +113,6 @@ _FILE_BASED_REVIEWER_INSTRUCTION = (
 
 
 
-class AllReviewersFailedError(Exception):
-    """Raised when every reviewer fails during a review step."""
-
 
 def _verdict_hint(verdict: str | None) -> str:
     """Return a short verification hint based on verdict type.
@@ -1149,7 +1146,7 @@ class ReviewEngine:
                 unresolved_issues=unresolved,
             )
 
-        except (AllReviewersFailedError, RuntimeError) as exc:
+        except RuntimeError as exc:
             # error_callback already invoked by _handle_runtime_error if applicable
             if self._archiver._session_dir is not None:
                 self._archiver.save_error_log(str(exc))
