@@ -27,11 +27,21 @@ class Archiver:
         self._base_dir = base_dir
         self._session_dir: str | None = None
 
+    @property
+    def workspace_dir(self) -> Path | None:
+        """Return the workspace directory path, or None if no session started."""
+        if self._session_dir is None:
+            return None
+        return Path(self._session_dir) / "workspace"
+
     def start_session(self, config) -> str:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
         session_path = Path(self._base_dir) / timestamp
         rounds_path = session_path / "rounds"
         os.makedirs(rounds_path, exist_ok=True)
+        # Create workspace directory for file-based agent interaction
+        workspace_path = session_path / "workspace"
+        os.makedirs(workspace_path, exist_ok=True)
 
         config_dict = asdict(config)
         _mask_api_keys(config_dict)
@@ -88,6 +98,9 @@ class Archiver:
                 f"rounds/ subdirectory not found in: {archive_path}"
             )
         self._session_dir = str(session_path)
+        # Ensure workspace directory exists for resumed sessions
+        workspace_path = session_path / "workspace"
+        os.makedirs(workspace_path, exist_ok=True)
         return self._session_dir
 
     def load_history(self) -> list[dict]:

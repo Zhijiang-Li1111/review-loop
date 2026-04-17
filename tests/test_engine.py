@@ -148,7 +148,7 @@ class TestAgentCreation:
         reviewer_call = MockAgent.call_args_list[2]
         system_msg = reviewer_call.kwargs["system_message"]
         assert "submit_review" in system_msg
-        assert "call submit_review" in system_msg
+        assert "submit_review" in system_msg
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
@@ -640,7 +640,7 @@ class TestAuthorFeedback:
             await engine._author_evaluate_feedback("v1", feedbacks)
 
         assert "Process feedback carefully." in captured_prompts[0]
-        assert "call submit_verdict" in captured_prompts[0]
+        assert "submit_verdict" in captured_prompts[0]
 
 
 # ---------------------------------------------------------------------------
@@ -1729,7 +1729,7 @@ class TestAuthorToolCallIntegration:
             await engine._author_evaluate_feedback("v1", feedbacks)
 
         assert len(captured_prompts) == 1
-        assert "call submit_verdict" in captured_prompts[0]
+        assert "submit_verdict" in captured_prompts[0]
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
@@ -1771,7 +1771,7 @@ class TestAuthorToolCallIntegration:
             await engine._author_apply_changes("v1", verdicts, feedbacks)
 
         assert len(captured_prompts) == 1
-        assert "call submit_revision" in captured_prompts[0]
+        assert "submit_revision" in captured_prompts[0]
 
 
 # ==================================================================
@@ -2039,3 +2039,306 @@ class TestSubmitReviewInstructionWhyPattern:
         system_msg = reviewer_call.kwargs.get("system_message", "")
         assert "why" in system_msg
         assert "pattern" in system_msg
+
+
+# ---------------------------------------------------------------------------
+# File-based Workspace Tests
+# ---------------------------------------------------------------------------
+
+
+class TestFileBasedWorkspace:
+    """Tests for the file-based workspace (draft.md) features."""
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_file_tools_injected_into_agents(self, MockAgent, MockCtxMgr, mock_import):
+        """FileTools should be injected into all agents when workspace_dir is set."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config(num_reviewers=2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            # Tools list should be a mock (from MockAgent) but _setup_file_tools
+            # hasn't been called yet since workspace_dir is set at init but
+            # _setup_file_tools is called in run(). Let's call it directly.
+            engine._workspace_dir = workspace
+            engine._file_tools_injected = False
+            # The agents are mocks, so tools is a MagicMock. We need real lists.
+            engine._author_verdict = MagicMock()
+            engine._author_verdict.tools = []
+            engine._author_revision = MagicMock()
+            engine._author_revision.tools = []
+            r1 = MagicMock()
+            r1.tools = []
+            engine._reviewers = [r1]
+
+            engine._setup_file_tools()
+
+            assert len(engine._author_verdict.tools) == 1
+            assert len(engine._author_revision.tools) == 1
+            assert len(r1.tools) == 1
+            assert engine._file_tools_injected is True
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_setup_file_tools_idempotent(self, MockAgent, MockCtxMgr, mock_import):
+        """Calling _setup_file_tools twice should only inject once."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config(num_reviewers=1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+            engine._author_verdict = MagicMock()
+            engine._author_verdict.tools = []
+            engine._author_revision = MagicMock()
+            engine._author_revision.tools = []
+            r1 = MagicMock()
+            r1.tools = []
+            engine._reviewers = [r1]
+
+            engine._setup_file_tools()
+            engine._setup_file_tools()  # second call should be no-op
+
+            assert len(engine._author_verdict.tools) == 1
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_read_draft_from_workspace(self, MockAgent, MockCtxMgr, mock_import):
+        """_read_draft_from_workspace should read draft.md from workspace."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            # No draft.md yet
+            assert engine._read_draft_from_workspace() is None
+
+            # Write a draft
+            (workspace / "draft.md").write_text("Hello world")
+            assert engine._read_draft_from_workspace() == "Hello world"
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_write_draft_to_workspace(self, MockAgent, MockCtxMgr, mock_import):
+        """_write_draft_to_workspace should write draft.md."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            engine._write_draft_to_workspace("Test content")
+            assert (workspace / "draft.md").read_text() == "Test content"
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_author_generate_reads_draft_from_file(self, MockAgent, MockCtxMgr, mock_import):
+        """_author_generate should prefer draft.md written by agent over text content."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            # Mock agent returns short text but writes long draft.md
+            long_draft = "A" * 600
+            async def fake_arun(**kwargs):
+                # Simulate agent writing draft.md via FileTools
+                (workspace / "draft.md").write_text(long_draft)
+                return MockRunOutput(content="short summary")
+
+            engine._author_revision = MagicMock()
+            engine._author_revision.arun = fake_arun
+            engine._author_revision.name = "Author"
+
+            import asyncio
+            result = asyncio.get_event_loop().run_until_complete(
+                engine._author_generate("context")
+            )
+            assert result == long_draft
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_author_generate_fallback_to_text(self, MockAgent, MockCtxMgr, mock_import):
+        """_author_generate should fallback to text when no draft.md is written."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            text_content = "B" * 600
+            async def fake_arun(**kwargs):
+                return MockRunOutput(content=text_content)
+
+            engine._author_revision = MagicMock()
+            engine._author_revision.arun = fake_arun
+            engine._author_revision.name = "Author"
+
+            import asyncio
+            result = asyncio.get_event_loop().run_until_complete(
+                engine._author_generate("context")
+            )
+            assert result == text_content
+            # Should also write to workspace
+            assert (workspace / "draft.md").read_text() == text_content
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_author_apply_changes_reads_draft_from_file(self, MockAgent, MockCtxMgr, mock_import):
+        """_author_apply_changes should prefer draft.md written via FileTools."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
+        import tempfile
+
+        config = _make_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            new_draft = "C" * 600
+            async def fake_arun(**kwargs):
+                (workspace / "draft.md").write_text(new_draft)
+                return MockRunOutput(content="done", tools=[])
+
+            engine._author_revision = MagicMock()
+            engine._author_revision.arun = fake_arun
+            engine._author_revision.name = "Author"
+
+            feedbacks = [ReviewerFeedback(
+                reviewer_name="R",
+                issues=[ReviewIssue(severity="minor", content="fix")]
+            )]
+            verdicts = [AuthorVerdictItem(
+                reviewer="R", issue_index=0, verdict="accept", reason="ok"
+            )]
+
+            import asyncio
+            result = asyncio.get_event_loop().run_until_complete(
+                engine._author_apply_changes("old content", verdicts, feedbacks)
+            )
+            assert result == new_draft
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_author_apply_changes_fallback_submit_revision(self, MockAgent, MockCtxMgr, mock_import):
+        """_author_apply_changes falls back to submit_revision when no draft.md."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
+        import tempfile
+
+        config = _make_config()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+
+            revised = "D" * 200
+            async def fake_arun(**kwargs):
+                return MockRunOutput(
+                    content=None,
+                    tools=[MockToolExecution(
+                        "submit_revision",
+                        {"updated_content": revised},
+                    )],
+                )
+
+            engine._author_revision = MagicMock()
+            engine._author_revision.arun = fake_arun
+            engine._author_revision.name = "Author"
+
+            feedbacks = [ReviewerFeedback(
+                reviewer_name="R",
+                issues=[ReviewIssue(severity="minor", content="fix")]
+            )]
+            verdicts = [AuthorVerdictItem(
+                reviewer="R", issue_index=0, verdict="accept", reason="ok"
+            )]
+
+            import asyncio
+            result = asyncio.get_event_loop().run_until_complete(
+                engine._author_apply_changes("old content", verdicts, feedbacks)
+            )
+            assert result == revised
+            # Should also be written to workspace
+            assert (workspace / "draft.md").read_text() == revised
+
+    @patch("review_loop.engine.import_from_path")
+    @patch("review_loop.engine.ContextManager")
+    @patch("review_loop.engine.Agent")
+    def test_review_prompt_uses_file_based_instructions(self, MockAgent, MockCtxMgr, mock_import):
+        """Reviewer prompts should instruct to use read_file('draft.md')."""
+        from pathlib import Path
+        from review_loop.engine import ReviewEngine
+        import tempfile
+
+        config = _make_config(num_reviewers=1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            workspace.mkdir()
+            engine = ReviewEngine(config, workspace_dir=workspace)
+            # draft.md must exist for _review() to proceed
+            (workspace / "draft.md").write_text("content here")
+
+            # Capture the prompt passed to reviewer
+            captured_prompt = None
+            async def fake_arun(**kwargs):
+                nonlocal captured_prompt
+                captured_prompt = kwargs.get("input", "")
+                return MockRunOutput(
+                    content=None,
+                    tools=[MockToolExecution(
+                        "submit_review",
+                        {"issues": "[]"},
+                    )],
+                )
+
+            reviewer = MagicMock()
+            reviewer.name = "Reviewer-A"
+            reviewer.arun = fake_arun
+            engine._reviewers = [reviewer]
+
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(
+                engine._review("content here", {}, round_num=1)
+            )
+
+            assert "read_file('draft.md')" in captured_prompt

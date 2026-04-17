@@ -162,3 +162,44 @@ class TestSaveContextAndError:
         path = Path(archiver._session_dir) / "error.log"
         assert path.exists()
         assert "All reviewers failed" in path.read_text()
+
+
+class TestWorkspace:
+    def _make_archiver(self, tmp_path: Path):
+        from review_loop.persistence import Archiver
+        archiver = Archiver(base_dir=str(tmp_path))
+        archiver.start_session(_MockConfig())
+        return archiver
+
+    def test_start_session_creates_workspace_dir(self, tmp_path: Path):
+        archiver = self._make_archiver(tmp_path)
+        workspace = Path(archiver._session_dir) / "workspace"
+        assert workspace.exists()
+        assert workspace.is_dir()
+
+    def test_workspace_dir_property(self, tmp_path: Path):
+        archiver = self._make_archiver(tmp_path)
+        assert archiver.workspace_dir is not None
+        assert archiver.workspace_dir == Path(archiver._session_dir) / "workspace"
+
+    def test_workspace_dir_none_before_session(self):
+        from review_loop.persistence import Archiver
+        archiver = Archiver()
+        assert archiver.workspace_dir is None
+
+    def test_resume_creates_workspace_dir(self, tmp_path: Path):
+        from review_loop.persistence import Archiver
+
+        # Create a session first
+        archiver = Archiver(base_dir=str(tmp_path))
+        session_dir = archiver.start_session(_MockConfig())
+
+        # Remove workspace dir to simulate old archives
+        workspace = Path(session_dir) / "workspace"
+        workspace.rmdir()
+        assert not workspace.exists()
+
+        # Resume should recreate it
+        archiver2 = Archiver()
+        archiver2.resume_session(session_dir)
+        assert workspace.exists()

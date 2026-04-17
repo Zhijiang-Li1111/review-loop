@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time as _time
 from dataclasses import asdict
 from pydantic import BaseModel, Field
 
+from pathlib import Path
+
 from agno.agent import Agent
 from agno.skills import Skills
 from agno.skills.loaders.local import LocalSkills
+from agno.tools.file import FileTools
 
 from review_loop.config import ReviewConfig, SkillConfig, build_claude
 from review_loop.context import ContextManager
@@ -66,31 +70,46 @@ def _build_skills(
 # Instruction appended to every reviewer's system prompt to ensure
 # they call the submit_review tool with structured output.
 _SUBMIT_REVIEW_INSTRUCTION = (
-    "\n\nAfter completing your review, call submit_review to submit your findings. "
-    "Pass an empty array if no issues were found. "
-    "Each issue should include why (explain why this is a problem) and pattern "
-    "(suggest checking the full text for similar occurrences). "
-    "These fields help the author fix problems proactively."
+    "\n\n审核完成后，请调用 submit_review 提交你的发现。"
+    "如果没有发现问题，请传入空数组。"
+    "每个 issue 应包含 why（解释为什么这是问题）和 pattern"
+    "（建议检查全文是否存在类似问题）。"
+    "这些字段有助于 Author 主动修复同类问题。"
 )
 
 # Instruction appended to the Author's prompt when evaluating feedback,
 # ensuring the Author calls submit_verdict with per-issue verdicts.
 _SUBMIT_VERDICT_INSTRUCTION = (
-    "\n\nAfter evaluating each reviewer issue, call submit_verdict to submit your verdicts. "
-    "This tool is only for verdicts — revised content goes in a separate submit_revision call. "
-    "The verdict and revision steps are two separate calls with no shared memory, "
-    "so the reason field is the only information the revision step will see. "
-    "For each accepted issue, describe the planned change in enough detail "
-    "that a separate agent could execute it (what to change, where, and how). "
-    "For each rejected issue, cite specific evidence from the content."
+    "\n\n评估完每个审核意见后，请调用 submit_verdict 提交你的裁定。"
+    "此工具仅用于裁定——修改后的正文通过单独的 submit_revision 调用提交。"
+    "裁定和修订是两个独立调用，不共享记忆，"
+    "因此 reason 字段是修订步骤能看到的唯一信息。"
+    "对于接受的 issue，请在 reason 中详细描述计划的修改"
+    "（改什么、在哪里、怎么改），使得独立的修订 agent 能够执行。"
+    "对于拒绝的 issue，请引用正文中的具体证据。"
 )
 
 # Instruction appended to the Author's prompt when applying changes,
 # ensuring the Author calls submit_revision with the complete revised content.
 _SUBMIT_REVISION_INSTRUCTION = (
-    "\n\nAfter applying changes, call submit_revision with the complete revised content. "
-    "This exact string replaces the previous version."
+    "\n\n修改完成后，请将完整的修改后正文保存到 draft.md（使用 save_file 工具）。"
+    "也可以调用 submit_revision 提交完整的修改后正文。"
+    "无论哪种方式，内容必须是完整的——它将直接替换上一版本。"
 )
+
+# Instruction for Author initial generation, telling them to write to draft.md
+_FILE_BASED_AUTHOR_GENERATE_INSTRUCTION = (
+    "\n\n请将你生成的完整正文保存到 draft.md 文件（使用 save_file 工具）。"
+    "这样审核员可以直接读取你的稿件。"
+)
+
+# Instruction for reviewers to read draft.md and write feedback files
+_FILE_BASED_REVIEWER_INSTRUCTION = (
+    "\n\n请先用 read_file('draft.md') 读取当前正文，再进行审核。"
+    "审核完成后，请将你的详细反馈写入 feedback_R{round}_{name}.md（使用 save_file 工具），"
+    "同时仍需调用 submit_review 提交结构化 issues 列表。"
+)
+
 
 
 class AllReviewersFailedError(Exception):
@@ -135,10 +154,12 @@ class ReviewEngine:
         if issue.pattern:
             parts.append(f"    pattern: {issue.pattern}")
 
-    def __init__(self, config: ReviewConfig):
+    def __init__(self, config: ReviewConfig, workspace_dir: Path | None = None):
         self._config = config
         self._archiver = Archiver()
         self._audit: AuditLogger | None = None
+        self._workspace_dir: Path | None = workspace_dir
+        self._file_tools_injected = False
 
         # Import tool classes for Author
         tool_instances = []
@@ -294,6 +315,51 @@ class ReviewEngine:
         if self._audit:
             self._audit.log_call_end(agent.name, elapsed, None, "exhausted_retries")
         return None
+
+    # ------------------------------------------------------------------
+    # File-based workspace helpers
+    # ------------------------------------------------------------------
+
+    def _setup_file_tools(self) -> None:
+        """Inject FileTools (scoped to workspace/) into all agents.
+
+        Called once in run() after workspace_dir is known. Safe to call
+        multiple times — skips if already injected.
+        """
+        if self._file_tools_injected or self._workspace_dir is None:
+            return
+
+        file_tools = FileTools(
+            base_dir=self._workspace_dir,
+            enable_save_file=True,
+            enable_read_file=True,
+            enable_list_files=True,
+            enable_delete_file=False,
+        )
+
+        for agent in [self._author_verdict, self._author_revision] + self._reviewers:
+            agent.tools.append(file_tools)
+
+        self._file_tools_injected = True
+
+    def _read_draft_from_workspace(self) -> str | None:
+        """Read draft.md from the workspace directory.
+
+        Returns the content string, or None if the file doesn't exist.
+        """
+        if self._workspace_dir is None:
+            return None
+        draft_path = self._workspace_dir / "draft.md"
+        if draft_path.exists():
+            return draft_path.read_text()
+        return None
+
+    def _write_draft_to_workspace(self, content: str) -> None:
+        """Write content to workspace/draft.md so agents can read it."""
+        if self._workspace_dir is None:
+            return
+        draft_path = self._workspace_dir / "draft.md"
+        draft_path.write_text(content)
 
     # ------------------------------------------------------------------
     # Tool call extraction
@@ -481,10 +547,20 @@ class ReviewEngine:
         prompt = (
             f"{context}\n\n"
             f"{self._config.author.initial_prompt}"
+            f"{_FILE_BASED_AUTHOR_GENERATE_INSTRUCTION}"
         )
         content = await self._safe_agent_call(self._author_revision, prompt)
+
+        # Check if Author wrote draft.md via FileTools
+        draft = self._read_draft_from_workspace()
+        if draft is not None and len(draft.strip()) > 500:
+            return draft
+
+        # Fallback: use the text returned by the agent
         if content is None:
             raise AllReviewersFailedError("Author failed to generate initial content")
+        # Also write to workspace so reviewers can read
+        self._write_draft_to_workspace(content)
         return content
 
     # ------------------------------------------------------------------
@@ -496,24 +572,37 @@ class ReviewEngine:
         content: str,
         per_reviewer_ctx: dict[str, str],
         guidance: str | None = None,
+        round_num: int = 0,
     ) -> list[ReviewerFeedback]:
         """All reviewers audit content in parallel."""
 
+        # Ensure draft.md exists before sending reviewers to read it
+        if self._workspace_dir is not None:
+            draft_path = self._workspace_dir / "draft.md"
+            if not draft_path.exists():
+                raise RuntimeError(
+                    "draft.md not found in workspace; "
+                    "cannot proceed with review"
+                )
+
         async def call_reviewer(reviewer: Agent) -> ReviewerFeedback | None:
             prev_ctx = per_reviewer_ctx.get(reviewer.name, "")
+            file_based_hint = _FILE_BASED_REVIEWER_INSTRUCTION.format(
+                round=round_num, name=reviewer.name,
+            )
             if prev_ctx:
                 prompt = (
                     f"{prev_ctx}\n\n"
-                    f"---\n⚠️ 以下为【当前内容】，是本轮审核的唯一判断依据。上方引用的原文片段仅供定位参考，issue 列表和 Author 回应仍需重点关注。\n---\n\n"
-                    f"{content}\n\n"
+                    f"---\n⚠️ 请先用 read_file('draft.md') 读取【当前内容】，这是本轮审核的唯一判断依据。上方引用的原文片段仅供定位参考，issue 列表和 Author 回应仍需重点关注。\n---\n\n"
                     f"请审核修改后的内容。对于 Author 接受并修改的 issue，检查修改是否真正解决了问题。"
                     f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。\n\n"
-                    f"注意：以上方【当前内容】为唯一判断依据。"
+                    f"注意：以 read_file('draft.md') 读取的【当前内容】为唯一判断依据。"
+                    f"{file_based_hint}"
                 )
             else:
                 prompt = (
-                    f"以下是需要审核的内容：\n\n{content}\n\n"
-                    f"请仔细审核上述内容，找出其中的问题。"
+                    f"请先用 read_file('draft.md') 读取需要审核的内容，然后仔细审核，找出其中的问题。"
+                    f"{file_based_hint}"
                 )
             if guidance:
                 prompt = f"📋 主编指导意见（供审核参考）：{guidance}\n\n" + prompt
@@ -534,6 +623,10 @@ class ReviewEngine:
                 return ReviewerFeedback(reviewer_name=reviewer.name, issues=issues)
 
             # Fallback: parse content as string (backward compatibility)
+            logger.warning(
+                "Reviewer '%s' did not call submit_review, falling back to text parsing",
+                reviewer.name,
+            )
             raw = run_output.content
             if raw is None:
                 return ReviewerFeedback(reviewer_name=reviewer.name, issues=[])
@@ -616,7 +709,7 @@ class ReviewEngine:
         prompt = (
             f"{guidance_prefix}"
             f"{self._config.author.receiving_review_prompt}\n\n"
-            f"当前内容：\n\n{content}\n\n"
+            f"⚠️ 你必须首先调用 read_file(\"draft.md\") 获取当前完整正文，不要凭记忆操作。\n\n"
             f"审核员反馈：\n\n{issues_text}"
             f"{_SUBMIT_VERDICT_INSTRUCTION}"
         )
@@ -646,37 +739,72 @@ class ReviewEngine:
         content: str,
         verdicts: list[AuthorVerdictItem],
         feedbacks: list[ReviewerFeedback],
+        round_num: int = 0,
     ) -> str:
         """Author applies accepted changes and outputs the full revised content.
 
-        The Author is expected to call submit_revision with the complete
-        revised content. If no tool call is found, we fall back to treating
-        the text response as the content.
+        The Author is expected to save the revised content to draft.md using
+        save_file, or call submit_revision. If neither is found, we fall back
+        to treating the text response as the content.
         """
         # Format verdicts for the Author prompt
         verdict_text = self._format_verdicts_for_author(verdicts, feedbacks)
+        # Build concrete feedback file list for the Author (fix #1)
+        feedback_files = [
+            f"feedback_R{round_num}_{fb.reviewer_name}.md"
+            for fb in feedbacks
+            if fb.issues
+        ]
+        if feedback_files:
+            file_list_hint = (
+                "\n\n本轮审核员的反馈文件："
+                + ", ".join(feedback_files)
+                + "\n你可以用 read_file 读取这些文件获取详细反馈。"
+            )
+        else:
+            file_list_hint = ""
         prompt = (
-            f"以下是当前内容：\n\n{content}\n\n"
+            f"⚠️ 你必须首先调用 read_file(\"draft.md\") 获取当前完整正文，不要凭记忆操作。\n\n"
             f"以下是你对审核意见的裁定：\n\n{verdict_text}\n\n"
             f"请根据你接受（accept）的意见修改内容，输出完整的修改后内容。"
             f"{_SUBMIT_REVISION_INSTRUCTION}"
+            f"{file_list_hint}"
         )
+
+        # Record draft.md mtime before agent call for stale-check
+        draft_mtime_before: float | None = None
+        if self._workspace_dir is not None:
+            draft_path = self._workspace_dir / "draft.md"
+            if draft_path.exists():
+                draft_mtime_before = os.path.getmtime(draft_path)
 
         run_output = await self._safe_agent_call_full(self._author_revision, prompt)
         if run_output is None:
             return content
 
-        # Strategy 1: Extract from submit_revision tool call
+        # Strategy 1: Check if Author wrote a NEW draft.md via FileTools (mtime changed)
+        if self._workspace_dir is not None:
+            draft_path = self._workspace_dir / "draft.md"
+            if draft_path.exists():
+                draft_mtime_after = os.path.getmtime(draft_path)
+                if draft_mtime_before is None or draft_mtime_after > draft_mtime_before:
+                    draft = draft_path.read_text()
+                    if len(draft.strip()) > 500:
+                        return draft
+
+        # Strategy 2: Extract from submit_revision tool call
         updated_content = self._extract_submit_revision(run_output)
         if updated_content is not None:
+            self._write_draft_to_workspace(updated_content)
             return updated_content
 
-        # Strategy 2: Fall back to text content
+        # Strategy 3: Fall back to text content
         raw = run_output.content
         if raw is None:
             return content
 
         # If the raw response looks like it could be the full content, use it
+        self._write_draft_to_workspace(raw)
         return raw
 
     def _format_issues_for_author(self, feedbacks: list[ReviewerFeedback]) -> str:
@@ -878,6 +1006,8 @@ class ReviewEngine:
                 )
             session_path = self._archiver.resume_session(resume_path)
             self._audit = AuditLogger(session_path)
+            self._workspace_dir = self._archiver.workspace_dir
+            self._setup_file_tools()
             history = self._archiver.load_history()
             if not history:
                 raise ValueError(
@@ -896,10 +1026,15 @@ class ReviewEngine:
             # Rebuild per_reviewer_ctx from last round's feedbacks and verdicts
             per_reviewer_ctx = self._rebuild_reviewer_ctx_from_history(last)
 
+            # Write current content to workspace/draft.md for file-based agents
+            self._write_draft_to_workspace(content)
+
         else:
             # Fresh start
             session_path = self._archiver.start_session(self._config)
             self._audit = AuditLogger(session_path)
+            self._workspace_dir = self._archiver.workspace_dir
+            self._setup_file_tools()
 
             # Build or load context
             if context is not None:
@@ -914,6 +1049,7 @@ class ReviewEngine:
             # Get initial content
             if initial_content is not None:
                 content = initial_content
+                self._write_draft_to_workspace(content)
             else:
                 content = await self._author_generate(ctx)
 
@@ -926,7 +1062,7 @@ class ReviewEngine:
         try:
             for round_num in range(start_round, max_rounds + 1):
                 # Reviewers audit in parallel
-                feedbacks = await self._review(content, per_reviewer_ctx, guidance=guidance)
+                feedbacks = await self._review(content, per_reviewer_ctx, guidance=guidance, round_num=round_num)
 
                 for fb in feedbacks:
                     self._archiver.save_reviewer_feedback(
@@ -955,7 +1091,7 @@ class ReviewEngine:
                 )
 
                 # Author applies changes (revision only)
-                updated_content = await self._author_apply_changes(content, verdicts, feedbacks)
+                updated_content = await self._author_apply_changes(content, verdicts, feedbacks, round_num=round_num)
 
                 self._archiver.save_author_response(
                     round_num,
@@ -966,6 +1102,7 @@ class ReviewEngine:
 
                 # Update content and prepare next round
                 content = updated_content
+                self._write_draft_to_workspace(content)
                 self._archiver.save_author_content(round_num + 1, content)
 
                 # Build per-reviewer context for next round
