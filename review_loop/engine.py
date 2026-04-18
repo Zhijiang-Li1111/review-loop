@@ -521,7 +521,7 @@ class ReviewEngine:
         prompt = (
             f"{guidance_prefix}"
             f"{self._config.author.receiving_review_prompt}\n\n"
-            f"⚠️ 你必须首先调用 read_file(\"draft.md\") 获取当前完整正文，不要凭记忆操作。\n\n"
+            f"⚠️ 请先调用 read_file(\"draft.md\") 获取当前完整正文——draft.md 是所有审核和修改的唯一基准，其他审核轮可能已经修改过内容，凭记忆操作会基于过时版本。\n\n"
             f"审核员反馈：\n\n{issues_text}"
             f"{_SUBMIT_VERDICT_INSTRUCTION}"
             f"\n\n请将裁定写入 {verdict_filename}。"
@@ -576,7 +576,7 @@ class ReviewEngine:
         else:
             file_list_hint = ""
         prompt = (
-            f"⚠️ 你必须首先调用 read_file(\"draft.md\") 获取当前完整正文，不要凭记忆操作。\n\n"
+            f"⚠️ 请先调用 read_file(\"draft.md\") 获取当前完整正文——draft.md 是所有审核和修改的唯一基准，其他审核轮可能已经修改过内容，凭记忆操作会基于过时版本。\n\n"
             f"以下是你对审核意见的裁定：\n\n{verdict_text}\n\n"
             f"请根据你接受（accept）的意见修改内容，输出完整的修改后内容。"
             f"{_SUBMIT_REVISION_INSTRUCTION}"
