@@ -614,8 +614,14 @@ class ReviewEngine:
                 prompt = (
                     f"{prev_ctx}\n\n"
                     f"---\n⚠️ 请先用 read_file('draft.md') 读取【当前内容】，这是本轮审核的唯一判断依据。上方引用的原文片段仅供定位参考，issue 列表和 Author 回应仍需重点关注。\n---\n\n"
-                    f"请审核修改后的内容。对于 Author 接受并修改的 issue，检查修改是否真正解决了问题。"
-                    f"对于 Author 反驳的 issue，评估反驳是否成立。可以提出新发现的 issue。\n\n"
+                    f"## 你这轮的首要任务：全文重审\n\n"
+                    f"Author 在修复上一轮 issue 时，几乎一定会引入新的问题——改了A段可能破坏B段的连贯性，"
+                    f"补了一个数据可能口径和前文不一致，删了一句话可能让论证链断裂。"
+                    f"这些'修改引入的新错误'比旧 issue 没修好危险得多，因为没有人专门盯过它们。\n\n"
+                    f"所以：先用 read_file('draft.md') 通读完整正文，把它当作你第一次看到的文章来审。"
+                    f"找出所有问题（包括新引入的），然后再回头检查上一轮的 issue：\n"
+                    f"- Author 接受并修改的 issue → 修改是否真正解决了问题？\n"
+                    f"- Author 反驳的 issue → 反驳理由是否成立？\n\n"
                     f"注意：以 read_file('draft.md') 读取的【当前内容】为唯一判断依据。"
                     f"{file_based_hint}"
                 )
