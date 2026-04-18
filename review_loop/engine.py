@@ -70,18 +70,22 @@ def _build_skills(
 
 # Instruction appended to every reviewer's system prompt to ensure
 # they write a structured feedback file.
-_SUBMIT_REVIEW_INSTRUCTION = (
-    "\n\n审核完成后，请将你的发现写入 feedback 文件（使用 save_file 工具）。"
-    "文件格式如下：\n"
+_FEEDBACK_FORMAT_SPEC = (
     "每个 issue 用 ## Issue N 开头，字段用 - key: value 格式：\n"
     "## Issue 1\n"
     "- severity: critical/major/minor/suggestion\n"
     "- content: 问题描述\n"
-    "- why: 为什么这是个问题\n"
-    "- pattern: 建议检查全文是否有类似问题\n\n"
+    "- why: 为什么这是个问题（帮助 Author 理解问题本质从而做出更好的修改）\n"
+    "- pattern: 建议检查全文是否有类似问题（提醒 Author 一并排查）\n\n"
     "如果没有发现问题，请写：\n"
     "## No Issues\n"
     "审核通过，未发现问题。\n"
+)
+
+# Appended to reviewer system_prompt — tells them to write feedback files
+_SUBMIT_REVIEW_INSTRUCTION = (
+    "\n\n审核完成后，请将你的发现写入 feedback 文件（使用 save_file 工具）。"
+    "文件格式如下：\n" + _FEEDBACK_FORMAT_SPEC
 )
 
 # Instruction appended to the Author's prompt when evaluating feedback,
@@ -115,18 +119,8 @@ _FILE_BASED_AUTHOR_GENERATE_INSTRUCTION = (
 _FILE_BASED_REVIEWER_INSTRUCTION = (
     "\n\n请先用 read_file('draft.md') 读取当前正文，再进行审核。"
     "审核完成后，请将你的详细反馈写入 feedback_R{round}_{name}.md（使用 save_file 工具）。"
-    "请严格按照以下格式写反馈文件：\n"
-    "## Issue 1\n"
-    "- severity: critical/major/minor/suggestion\n"
-    "- content: 问题描述\n"
-    "- why: 为什么这是个问题\n"
-    "- pattern: 建议检查全文是否有类似问题\n\n"
-    "如果没有问题，请写：\n"
-    "## No Issues\n"
-    "审核通过，未发现问题。\n"
+    "请按照以下格式写反馈文件：\n" + _FEEDBACK_FORMAT_SPEC
 )
-
-
 
 
 def _verdict_hint(verdict: str | None) -> str:
