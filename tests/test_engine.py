@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -22,33 +24,6 @@ class MockRunOutput:
         self.content = content
         self.tools = tools or []
         self.messages = messages or []
-
-
-class MockToolExecution:
-    """Simulates agno ToolExecution."""
-    def __init__(self, tool_name: str, tool_args: dict | None = None, result: str | None = None):
-        self.tool_name = tool_name
-        self.tool_args = tool_args
-        self.result = result
-        self.tool_call_id = None
-        self.tool_call_error = None
-
-
-class MockMessage:
-    """Simulates agno Message with tool call fields."""
-    def __init__(
-        self,
-        role: str = "assistant",
-        content: str | None = None,
-        tool_name: str | None = None,
-        tool_args=None,
-        tool_calls=None,
-    ):
-        self.role = role
-        self.content = content
-        self.tool_name = tool_name
-        self.tool_args = tool_args
-        self.tool_calls = tool_calls
 
 
 def _make_config(
@@ -106,40 +81,33 @@ class TestAgentCreation:
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewers_have_submit_review_tool(self, MockAgent, MockCtxMgr, mock_import):
-        """Reviewers should get submit_review as a tool (not output_schema)."""
+    def test_reviewers_have_no_submit_review_tool(self, MockAgent, MockCtxMgr, mock_import):
+        """Reviewers should NOT have submit_review tool (file-based now)."""
         from review_loop.engine import ReviewEngine
-        from review_loop.tools import submit_review, submit_revision, submit_verdict
 
         config = _make_config(num_reviewers=2)
         engine = ReviewEngine(config)
 
-        # Author verdict agent (first call) should have only submit_verdict
+        # Author verdict agent (first call) should have no tools (no external tools configured)
         author_verdict_call = MockAgent.call_args_list[0]
-        assert "output_schema" not in author_verdict_call.kwargs
         verdict_tools = author_verdict_call.kwargs.get("tools", [])
-        assert submit_verdict in verdict_tools
-        assert submit_revision not in verdict_tools
+        assert len(verdict_tools) == 0
 
-        # Author revision agent (second call) should have only submit_revision
+        # Author revision agent (second call) should have no tools
         author_revision_call = MockAgent.call_args_list[1]
-        assert "output_schema" not in author_revision_call.kwargs
         revision_tools = author_revision_call.kwargs.get("tools", [])
-        assert submit_revision in revision_tools
-        assert submit_verdict not in revision_tools
+        assert len(revision_tools) == 0
 
-        # Reviewers should NOT have output_schema
+        # Reviewers should have no tools (no per-reviewer tools configured)
         for call in MockAgent.call_args_list[2:]:
-            assert "output_schema" not in call.kwargs
-            # Should have submit_review in tools
             tools = call.kwargs.get("tools", [])
-            assert submit_review in tools
+            assert len(tools) == 0
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewer_system_prompt_has_submit_instruction(self, MockAgent, MockCtxMgr, mock_import):
-        """Reviewer system prompt should include submit_review instruction."""
+    def test_reviewer_system_prompt_has_feedback_instruction(self, MockAgent, MockCtxMgr, mock_import):
+        """Reviewer system prompt should include file-based feedback instruction."""
         from review_loop.engine import ReviewEngine
 
         config = _make_config(num_reviewers=1)
@@ -147,14 +115,14 @@ class TestAgentCreation:
 
         reviewer_call = MockAgent.call_args_list[2]
         system_msg = reviewer_call.kwargs["system_message"]
-        assert "submit_review" in system_msg
-        assert "submit_review" in system_msg
+        assert "feedback" in system_msg.lower() or "save_file" in system_msg
+        assert "why" in system_msg
+        assert "pattern" in system_msg
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_author_gets_tools(self, MockAgent, MockCtxMgr):
+    def test_author_gets_external_tools(self, MockAgent, MockCtxMgr):
         from review_loop.engine import ReviewEngine
-        from review_loop.tools import submit_revision, submit_verdict
 
         class FakeTool:
             def __init__(self, context=None):
@@ -164,44 +132,21 @@ class TestAgentCreation:
             config = _make_config(tools=[ToolConfig(path="pkg.FakeTool")])
             engine = ReviewEngine(config)
 
-        # Verdict agent (first call) should have FakeTool + submit_verdict
+        # Verdict agent (first call) should have only FakeTool (no submit_verdict)
         verdict_call = MockAgent.call_args_list[0]
         assert verdict_call.kwargs.get("tools") is not None
-        assert len(verdict_call.kwargs["tools"]) == 2  # FakeTool + submit_verdict
-        assert submit_verdict in verdict_call.kwargs["tools"]
+        assert len(verdict_call.kwargs["tools"]) == 1  # FakeTool only
 
-        # Revision agent (second call) should have FakeTool + submit_revision
+        # Revision agent (second call) should have only FakeTool (no submit_revision)
         revision_call = MockAgent.call_args_list[1]
         assert revision_call.kwargs.get("tools") is not None
-        assert len(revision_call.kwargs["tools"]) == 2  # FakeTool + submit_revision
-        assert submit_revision in revision_call.kwargs["tools"]
+        assert len(revision_call.kwargs["tools"]) == 1  # FakeTool only
 
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_reviewers_get_submit_review_even_without_per_reviewer_tools(self, MockAgent, MockCtxMgr):
-        """Reviewers always get submit_review, even when no per-reviewer tools are configured."""
+    def test_reviewer_gets_per_reviewer_tools(self, MockAgent, MockCtxMgr):
+        """Per-reviewer tools work without submit_review."""
         from review_loop.engine import ReviewEngine
-        from review_loop.tools import submit_review
-
-        class FakeTool:
-            def __init__(self, context=None):
-                pass
-
-        with patch("review_loop.engine.import_from_path", return_value=FakeTool):
-            config = _make_config(tools=[ToolConfig(path="pkg.FakeTool")])
-            engine = ReviewEngine(config)
-
-        for call in MockAgent.call_args_list[2:]:
-            tools_arg = call.kwargs.get("tools")
-            assert tools_arg is not None
-            assert submit_review in tools_arg
-
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
-    def test_reviewer_gets_per_reviewer_tools_plus_submit_review(self, MockAgent, MockCtxMgr):
-        """Per-reviewer tools coexist with submit_review."""
-        from review_loop.engine import ReviewEngine
-        from review_loop.tools import submit_review
 
         class FakeAuthorTool:
             def __init__(self, context=None):
@@ -246,155 +191,22 @@ class TestAgentCreation:
         # Agent calls: Author-verdict, Author-revision, Reviewer-A, Reviewer-B
         assert MockAgent.call_count == 4
 
-        # Reviewer-A should have submit_review + per-reviewer tool
+        # Reviewer-A should have only per-reviewer tool (no submit_review)
         reviewer_a_call = MockAgent.call_args_list[2]
         assert reviewer_a_call.kwargs["name"] == "Reviewer-A"
         tools_a = reviewer_a_call.kwargs["tools"]
-        assert tools_a is not None
-        assert submit_review in tools_a
-        assert len(tools_a) == 2  # submit_review + FakeReviewerTool
-        # Check that per-reviewer tool is also there
-        per_reviewer_tools = [t for t in tools_a if t is not submit_review]
-        assert len(per_reviewer_tools) == 1
-        assert per_reviewer_tools[0].tag == "reviewer"
+        assert len(tools_a) == 1  # FakeReviewerTool only
+        assert tools_a[0].tag == "reviewer"
 
-        # Reviewer-B should have only submit_review
+        # Reviewer-B should have no tools
         reviewer_b_call = MockAgent.call_args_list[3]
         assert reviewer_b_call.kwargs["name"] == "Reviewer-B"
         tools_b = reviewer_b_call.kwargs["tools"]
-        assert tools_b is not None
-        assert submit_review in tools_b
-        assert len(tools_b) == 1
+        assert len(tools_b) == 0
 
 
 # ---------------------------------------------------------------------------
-# Tool Call Extraction
-# ---------------------------------------------------------------------------
-
-
-class TestToolCallExtraction:
-    """Tests for _extract_tool_call_issues static method."""
-
-    def test_extract_from_tool_execution(self):
-        """Extract issues from RunOutput.tools (ToolExecution objects)."""
-        from review_loop.engine import ReviewEngine
-
-        issues_json = json.dumps([
-            {"severity": "critical", "content": "Missing validation"},
-            {"severity": "minor", "content": "Style issue"},
-        ])
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_review",
-                tool_args={"issues": issues_json},
-            )]
-        )
-
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert len(result) == 2
-        assert result[0]["severity"] == "critical"
-        assert result[1]["content"] == "Style issue"
-
-    def test_extract_empty_issues_from_tool_execution(self):
-        """Empty issues list from tool call."""
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_review",
-                tool_args={"issues": "[]"},
-            )]
-        )
-
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert result == []
-
-    def test_extract_from_message_tool_name(self):
-        """Extract from message where tool_name=submit_review and tool_args is set."""
-        from review_loop.engine import ReviewEngine
-
-        issues_json = json.dumps([{"severity": "major", "content": "Bad logic"}])
-        run_output = MockRunOutput(
-            messages=[MockMessage(
-                role="tool",
-                tool_name="submit_review",
-                tool_args={"issues": issues_json},
-            )]
-        )
-
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["severity"] == "major"
-
-    def test_extract_from_message_tool_calls(self):
-        """Extract from assistant message with tool_calls list."""
-        from review_loop.engine import ReviewEngine
-
-        issues_data = [{"severity": "minor", "content": "Typo"}]
-        args = json.dumps({"issues": json.dumps(issues_data)})
-        run_output = MockRunOutput(
-            messages=[MockMessage(
-                role="assistant",
-                tool_calls=[{
-                    "function": {
-                        "name": "submit_review",
-                        "arguments": args,
-                    }
-                }],
-            )]
-        )
-
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["content"] == "Typo"
-
-    def test_no_submit_review_returns_none(self):
-        """No submit_review tool call -> returns None."""
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            content="Just some text",
-            tools=[MockToolExecution(
-                tool_name="search_research",
-                tool_args={"query": "something"},
-            )],
-        )
-
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is None
-
-    def test_empty_run_output_returns_none(self):
-        """Empty RunOutput -> returns None."""
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput()
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is None
-
-    def test_ignores_other_tools(self):
-        """Only extracts from submit_review, ignores other tool calls."""
-        from review_loop.engine import ReviewEngine
-
-        issues_json = json.dumps([{"severity": "critical", "content": "Issue found"}])
-        run_output = MockRunOutput(
-            tools=[
-                MockToolExecution(tool_name="search_research", tool_args={"query": "foo"}),
-                MockToolExecution(tool_name="submit_review", tool_args={"issues": issues_json}),
-            ]
-        )
-
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["severity"] == "critical"
-
-
-# ---------------------------------------------------------------------------
-# Review Phase
+# Review Phase (file-based)
 # ---------------------------------------------------------------------------
 
 
@@ -402,8 +214,8 @@ class TestReviewPhase:
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @pytest.mark.asyncio
-    async def test_reviewers_audit_in_parallel_via_tool_call(self, MockCtxMgr, mock_import):
-        """Reviewers submit structured output via submit_review tool call."""
+    async def test_reviewers_write_feedback_files(self, MockCtxMgr, mock_import):
+        """Reviewers submit feedback via files parsed by engine."""
         from review_loop.engine import ReviewEngine
 
         mock_reviewers = [MagicMock(), MagicMock()]
@@ -418,41 +230,38 @@ class TestReviewPhase:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        issues_a = json.dumps([{"severity": "critical", "content": "Logic gap"}])
-        issues_b = json.dumps([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            engine._workspace_dir = workspace
+            (workspace / "draft.md").write_text("content here")
 
-        async def mock_safe_call_full(agent, prompt):
-            if agent.name == "Reviewer-A":
-                return MockRunOutput(
-                    content="Review complete",
-                    tools=[MockToolExecution(
-                        tool_name="submit_review",
-                        tool_args={"issues": issues_a},
-                    )],
-                )
-            return MockRunOutput(
-                content="No issues found",
-                tools=[MockToolExecution(
-                    tool_name="submit_review",
-                    tool_args={"issues": issues_b},
-                )],
-            )
+            async def mock_safe_call(agent, prompt):
+                if agent.name == "Reviewer-A":
+                    (workspace / "feedback_R1_Reviewer-A.md").write_text(
+                        "## Issue 1\n- severity: critical\n- content: Logic gap\n- why: Missing step\n- pattern: Check all logic\n"
+                    )
+                else:
+                    (workspace / "feedback_R1_Reviewer-B.md").write_text(
+                        "## No Issues\n审核通过。\n"
+                    )
+                return "done"
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            feedbacks = await engine._review("Content v1", {})
+            with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+                feedbacks = await engine._review("Content v1", {}, round_num=1)
 
         assert len(feedbacks) == 2
         fb_a = next(f for f in feedbacks if f.reviewer_name == "Reviewer-A")
         fb_b = next(f for f in feedbacks if f.reviewer_name == "Reviewer-B")
         assert len(fb_a.issues) == 1
         assert fb_a.issues[0].severity == "critical"
+        assert fb_a.issues[0].content == "Logic gap"
         assert len(fb_b.issues) == 0
 
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @pytest.mark.asyncio
     async def test_review_fallback_to_string_parsing(self, MockCtxMgr, mock_import):
-        """When no tool call present, fall back to string JSON parsing."""
+        """When no feedback file, fall back to string JSON parsing."""
         from review_loop.engine import ReviewEngine
 
         mock_reviewers = [MagicMock()]
@@ -466,14 +275,17 @@ class TestReviewPhase:
             config = _make_config(num_reviewers=1)
             engine = ReviewEngine(config)
 
-        # No tool calls — just content with JSON
-        async def mock_safe_call_full(agent, prompt):
-            return MockRunOutput(
-                content='{"issues": [{"severity": "major", "content": "Bad data"}]}',
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            engine._workspace_dir = workspace
+            (workspace / "draft.md").write_text("content here")
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            feedbacks = await engine._review("Content v1", {})
+            # No feedback file written — just returns JSON text
+            async def mock_safe_call(agent, prompt):
+                return '{"issues": [{"severity": "major", "content": "Bad data"}]}'
+
+            with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+                feedbacks = await engine._review("Content v1", {}, round_num=1)
 
         assert len(feedbacks) == 1
         assert len(feedbacks[0].issues) == 1
@@ -497,25 +309,27 @@ class TestReviewPhase:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        captured_prompts = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            engine._workspace_dir = workspace
+            (workspace / "draft.md").write_text("content here")
 
-        async def mock_safe_call_full(agent, prompt):
-            captured_prompts[agent.name] = prompt
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_review",
-                    tool_args={"issues": "[]"},
-                )],
-            )
+            captured_prompts = {}
 
-        # Build per-reviewer context
-        per_reviewer_ctx = {
-            "Reviewer-A": "Issue A context only",
-            "Reviewer-B": "Issue B context only",
-        }
+            async def mock_safe_call(agent, prompt):
+                captured_prompts[agent.name] = prompt
+                (workspace / f"feedback_R1_{agent.name}.md").write_text(
+                    "## No Issues\n审核通过。\n"
+                )
+                return "done"
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            await engine._review("Content v2", per_reviewer_ctx)
+            per_reviewer_ctx = {
+                "Reviewer-A": "Issue A context only",
+                "Reviewer-B": "Issue B context only",
+            }
+
+            with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+                await engine._review("Content v2", per_reviewer_ctx, round_num=1)
 
         assert "Issue A context only" in captured_prompts["Reviewer-A"]
         assert "Issue B context only" not in captured_prompts["Reviewer-A"]
@@ -533,7 +347,7 @@ class TestAuthorFeedback:
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
     @pytest.mark.asyncio
-    async def test_author_evaluate_feedback(self, MockAgent, MockCtxMgr, mock_import):
+    async def test_author_evaluate_feedback_via_file(self, MockAgent, MockCtxMgr, mock_import):
         from review_loop.engine import ReviewEngine
         from review_loop.models import ReviewerFeedback, ReviewIssue
 
@@ -547,23 +361,18 @@ class TestAuthorFeedback:
             )
         ]
 
-        verdicts_json = json.dumps([{
-            "reviewer": "Reviewer-A",
-            "issue_index": 0,
-            "verdict": "accept",
-            "reason": "Fixed in v2",
-        }])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            engine._workspace_dir = workspace
 
-        async def mock_safe_call_full(agent, prompt):
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_verdict",
-                    tool_args={"verdicts": verdicts_json},
-                )],
-            )
+            async def mock_safe_call(agent, prompt):
+                (workspace / "verdict_R1.md").write_text(
+                    "## Issue 0 (Reviewer-A)\n- verdict: accept\n- reason: Fixed in v2\n"
+                )
+                return "done"
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            verdicts = await engine._author_evaluate_feedback("Content v1", feedbacks)
+            with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+                verdicts = await engine._author_evaluate_feedback("Content v1", feedbacks, round_num=1)
 
         assert len(verdicts) == 1
         assert verdicts[0].verdict == "accept"
@@ -572,7 +381,7 @@ class TestAuthorFeedback:
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
     @pytest.mark.asyncio
-    async def test_author_apply_changes(self, MockAgent, MockCtxMgr, mock_import):
+    async def test_author_apply_changes_via_draft(self, MockAgent, MockCtxMgr, mock_import):
         from review_loop.engine import ReviewEngine
         from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
 
@@ -592,18 +401,17 @@ class TestAuthorFeedback:
             )
         ]
 
-        async def mock_safe_call_full(agent, prompt):
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_revision",
-                    tool_args={
-                        "updated_content": "Content v2 with fix applied " * 10,
-                    },
-                )],
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            engine._workspace_dir = workspace
+            new_draft = "Content v2 with fix applied " * 20
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            updated = await engine._author_apply_changes("Content v1", verdicts, feedbacks)
+            async def mock_safe_call(agent, prompt):
+                (workspace / "draft.md").write_text(new_draft)
+                return "done"
+
+            with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+                updated = await engine._author_apply_changes("Content v1", verdicts, feedbacks)
 
         assert "Content v2 with fix applied" in updated
 
@@ -627,20 +435,15 @@ class TestAuthorFeedback:
 
         captured_prompts = []
 
-        async def mock_safe_call_full(agent, prompt):
+        async def mock_safe_call(agent, prompt):
             captured_prompts.append(prompt)
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_verdict",
-                    tool_args={"verdicts": "[]"},
-                )],
-            )
+            return "done"
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            await engine._author_evaluate_feedback("v1", feedbacks)
+        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+            await engine._author_evaluate_feedback("v1", feedbacks, round_num=1)
 
         assert "Process feedback carefully." in captured_prompts[0]
-        assert "submit_verdict" in captured_prompts[0]
+        assert "verdict" in captured_prompts[0].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -723,18 +526,21 @@ class TestErrorHandling:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        async def mock_safe_call_full(agent, prompt):
-            if agent.name == "Reviewer-A":
-                return None  # failure
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_review",
-                    tool_args={"issues": "[]"},
-                )],
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Path(tmpdir)
+            engine._workspace_dir = workspace
+            (workspace / "draft.md").write_text("content")
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            feedbacks = await engine._review("Content", {})
+            async def mock_safe_call(agent, prompt):
+                if agent.name == "Reviewer-A":
+                    return None  # failure
+                (workspace / "feedback_R0_Reviewer-B.md").write_text(
+                    "## No Issues\n审核通过。\n"
+                )
+                return "done"
+
+            with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
+                feedbacks = await engine._review("Content", {})
 
         assert len(feedbacks) == 1
         assert feedbacks[0].reviewer_name == "Reviewer-B"
@@ -757,10 +563,10 @@ class TestErrorHandling:
             config = _make_config(num_reviewers=2)
             engine = ReviewEngine(config)
 
-        async def mock_safe_call_full(agent, prompt):
+        async def mock_safe_call(agent, prompt):
             return None
 
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
+        with patch.object(engine, "_safe_agent_call", side_effect=mock_safe_call):
             with pytest.raises(RuntimeError, match="所有审核员均失败"):
                 await engine._review("Content", {})
 
@@ -1181,13 +987,12 @@ class TestReviewerPromptTemplateExpansion:
         assert MockAgent.call_count == 4
 
         # The Checker reviewer should have the author prompt expanded
-        # (plus submit_review instruction appended)
         checker_call = MockAgent.call_args_list[2]
         assert checker_call.kwargs["name"] == "Checker"
         assert "Author rules: write hooks, use frameworks." in checker_call.kwargs["system_message"]
         assert "{{author.system_prompt}}" not in checker_call.kwargs["system_message"]
 
-        # The Editor reviewer should have base prompt + submit_review instruction
+        # The Editor reviewer should have base prompt + feedback instruction
         editor_call = MockAgent.call_args_list[3]
         assert editor_call.kwargs["name"] == "Editor"
         assert "You are an editor." in editor_call.kwargs["system_message"]
@@ -1206,572 +1011,6 @@ class TestReviewerPromptTemplateExpansion:
         assert "You are reviewer A." in reviewer_a_call.kwargs["system_message"]
         reviewer_b_call = MockAgent.call_args_list[3]
         assert "You are reviewer B." in reviewer_b_call.kwargs["system_message"]
-
-
-# ---------------------------------------------------------------------------
-# submit_review Tool Tests
-# ---------------------------------------------------------------------------
-
-
-class TestSubmitReviewTool:
-    """Tests for the submit_review tool function itself."""
-
-    def test_valid_issues_json(self):
-        from review_loop.tools import submit_review
-
-        result = submit_review('[{"severity": "critical", "content": "Missing validation"}]')
-        parsed = json.loads(result)
-        assert parsed["status"] == "submitted"
-        assert parsed["issue_count"] == 1
-
-    def test_empty_issues(self):
-        from review_loop.tools import submit_review
-
-        result = submit_review("[]")
-        parsed = json.loads(result)
-        assert parsed["status"] == "submitted"
-        assert parsed["issue_count"] == 0
-
-    def test_multiple_issues(self):
-        from review_loop.tools import submit_review
-
-        issues = json.dumps([
-            {"severity": "critical", "content": "Issue 1"},
-            {"severity": "minor", "content": "Issue 2"},
-            {"severity": "major", "content": "Issue 3"},
-        ])
-        result = submit_review(issues)
-        parsed = json.loads(result)
-        assert parsed["issue_count"] == 3
-
-    def test_invalid_json(self):
-        from review_loop.tools import submit_review
-
-        result = submit_review("not json")
-        assert "Error" in result
-
-    def test_non_array_json(self):
-        from review_loop.tools import submit_review
-
-        result = submit_review('{"not": "array"}')
-        assert "Error" in result
-
-    def test_missing_severity(self):
-        from review_loop.tools import submit_review
-
-        result = submit_review('[{"content": "no severity"}]')
-        assert "Error" in result
-        assert "severity" in result
-
-    def test_missing_content(self):
-        from review_loop.tools import submit_review
-
-        result = submit_review('[{"severity": "minor"}]')
-        assert "Error" in result
-        assert "content" in result
-
-
-# ---------------------------------------------------------------------------
-# submit_verdict Tool Tests
-# ---------------------------------------------------------------------------
-
-
-class TestSubmitVerdictTool:
-    """Tests for the submit_verdict tool function itself."""
-
-    def test_valid_verdicts(self):
-        from review_loop.tools import submit_verdict
-
-        verdicts = json.dumps([{
-            "reviewer": "Reviewer-A",
-            "issue_index": 0,
-            "verdict": "accept",
-            "reason": "Fixed",
-        }])
-        result = submit_verdict(verdicts)
-        parsed = json.loads(result)
-        assert parsed["status"] == "submitted"
-        assert parsed["verdict_counts"]["accept"] == 1
-
-    def test_multiple_verdicts(self):
-        from review_loop.tools import submit_verdict
-
-        verdicts = json.dumps([
-            {"reviewer": "R-A", "issue_index": 0, "verdict": "accept", "reason": "Fixed"},
-            {"reviewer": "R-A", "issue_index": 1, "verdict": "reject", "reason": "Disagree"},
-            {"reviewer": "R-B", "issue_index": 0, "verdict": "unclear", "reason": "Need info"},
-        ])
-        result = submit_verdict(verdicts)
-        parsed = json.loads(result)
-        assert parsed["verdict_counts"]["accept"] == 1
-        assert parsed["verdict_counts"]["reject"] == 1
-        assert parsed["verdict_counts"]["unclear"] == 1
-
-    def test_empty_verdicts(self):
-        from review_loop.tools import submit_verdict
-
-        result = submit_verdict("[]")
-        parsed = json.loads(result)
-        assert parsed["status"] == "submitted"
-        assert parsed["verdict_counts"]["accept"] == 0
-
-    def test_rejects_invalid_json(self):
-        from review_loop.tools import submit_verdict
-
-        result = submit_verdict("not json")
-        assert "Error" in result
-
-    def test_rejects_non_array(self):
-        from review_loop.tools import submit_verdict
-
-        result = submit_verdict('{"not": "array"}')
-        assert "Error" in result
-
-    def test_rejects_missing_fields(self):
-        from review_loop.tools import submit_verdict
-
-        verdicts = json.dumps([{"reviewer": "R-A"}])  # missing fields
-        result = submit_verdict(verdicts)
-        assert "Error" in result
-
-    def test_rejects_invalid_verdict_value(self):
-        from review_loop.tools import submit_verdict
-
-        verdicts = json.dumps([{
-            "reviewer": "R-A",
-            "issue_index": 0,
-            "verdict": "maybe",
-            "reason": "Not sure",
-        }])
-        result = submit_verdict(verdicts)
-        assert "Error" in result
-        assert "maybe" in result
-
-
-class TestSubmitRevisionTool:
-    """Tests for the submit_revision tool function itself."""
-
-    def test_valid_revision(self):
-        from review_loop.tools import submit_revision
-
-        content = "A" * 200  # Must be >= 100 chars
-        result = submit_revision(content)
-        parsed = json.loads(result)
-        assert parsed["status"] == "submitted"
-        assert parsed["content_length"] == 200
-
-    def test_rejects_short_content(self):
-        from review_loop.tools import submit_revision
-
-        result = submit_revision("too short")
-        assert "Error" in result
-        assert "only" in result.lower() or "100" in result
-
-    def test_rejects_empty_content(self):
-        from review_loop.tools import submit_revision
-
-        result = submit_revision("")
-        assert "Error" in result
-
-
-# ---------------------------------------------------------------------------
-# Author submit_revision Tool Call Extraction
-# ---------------------------------------------------------------------------
-
-
-class TestExtractSubmitRevision:
-    """Tests for _extract_submit_revision static method."""
-
-    def test_extract_from_tool_execution(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_revision",
-                tool_args={
-                    "updated_content": "Full revised content here " * 10,
-                },
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_revision(run_output)
-        assert result is not None
-        assert "Full revised content here" in result
-
-    def test_extract_from_message_tool_name(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            messages=[MockMessage(
-                role="tool",
-                tool_name="submit_revision",
-                tool_args={
-                    "updated_content": "Updated content from message " * 10,
-                },
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_revision(run_output)
-        assert result is not None
-        assert "Updated content from message" in result
-
-    def test_extract_from_message_tool_calls(self):
-        from review_loop.engine import ReviewEngine
-
-        args = json.dumps({
-            "updated_content": "Content from tool_calls list " * 10,
-        })
-        run_output = MockRunOutput(
-            messages=[MockMessage(
-                role="assistant",
-                tool_calls=[{
-                    "function": {
-                        "name": "submit_revision",
-                        "arguments": args,
-                    }
-                }],
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_revision(run_output)
-        assert result is not None
-        assert "Content from tool_calls list" in result
-
-    def test_no_submit_revision_returns_none(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            content="Just text",
-            tools=[MockToolExecution(
-                tool_name="submit_review",
-                tool_args={"issues": "[]"},
-            )],
-        )
-
-        result = ReviewEngine._extract_submit_revision(run_output)
-        assert result is None
-
-    def test_empty_run_output_returns_none(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput()
-        result = ReviewEngine._extract_submit_revision(run_output)
-        assert result is None
-
-    def test_missing_updated_content_returns_none(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_revision",
-                tool_args={},  # no updated_content
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_revision(run_output)
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Author submit_verdict Tool Call Extraction
-# ---------------------------------------------------------------------------
-
-
-class TestExtractSubmitVerdict:
-    """Tests for _extract_submit_verdict static method."""
-
-    def test_extract_from_tool_execution(self):
-        from review_loop.engine import ReviewEngine
-
-        verdicts_json = json.dumps([
-            {"reviewer": "R-A", "issue_index": 0, "verdict": "accept", "reason": "Fixed"},
-        ])
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_verdict",
-                tool_args={"verdicts": verdicts_json},
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_verdict(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0].verdict == "accept"
-        assert result[0].reviewer == "R-A"
-
-    def test_extract_from_message_tool_name(self):
-        from review_loop.engine import ReviewEngine
-
-        verdicts_json = json.dumps([
-            {"reviewer": "R-B", "issue_index": 0, "verdict": "reject", "reason": "Disagree"},
-        ])
-        run_output = MockRunOutput(
-            messages=[MockMessage(
-                role="tool",
-                tool_name="submit_verdict",
-                tool_args={"verdicts": verdicts_json},
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_verdict(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0].verdict == "reject"
-
-    def test_extract_from_message_tool_calls(self):
-        from review_loop.engine import ReviewEngine
-
-        verdicts = [{"reviewer": "R-A", "issue_index": 0, "verdict": "accept", "reason": "Done"}]
-        args = json.dumps({"verdicts": json.dumps(verdicts)})
-        run_output = MockRunOutput(
-            messages=[MockMessage(
-                role="assistant",
-                tool_calls=[{
-                    "function": {
-                        "name": "submit_verdict",
-                        "arguments": args,
-                    }
-                }],
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_verdict(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0].verdict == "accept"
-
-    def test_empty_verdicts(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_verdict",
-                tool_args={"verdicts": "[]"},
-            )]
-        )
-
-        result = ReviewEngine._extract_submit_verdict(run_output)
-        assert result is not None
-        assert result == []
-
-    def test_no_submit_verdict_returns_none(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput(
-            content="Just text",
-            tools=[MockToolExecution(
-                tool_name="submit_review",
-                tool_args={"issues": "[]"},
-            )],
-        )
-
-        result = ReviewEngine._extract_submit_verdict(run_output)
-        assert result is None
-
-    def test_empty_run_output_returns_none(self):
-        from review_loop.engine import ReviewEngine
-
-        run_output = MockRunOutput()
-        result = ReviewEngine._extract_submit_verdict(run_output)
-        assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Author Tool-Call Integration
-# ---------------------------------------------------------------------------
-
-
-class TestAuthorToolCallIntegration:
-    """Tests for _author_evaluate_feedback and _author_apply_changes using tool calls."""
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
-    @pytest.mark.asyncio
-    async def test_author_uses_submit_verdict_tool(self, MockAgent, MockCtxMgr, mock_import):
-        from review_loop.engine import ReviewEngine
-        from review_loop.models import ReviewerFeedback, ReviewIssue
-
-        config = _make_config(num_reviewers=1)
-        engine = ReviewEngine(config)
-
-        feedbacks = [
-            ReviewerFeedback(
-                reviewer_name="Reviewer-A",
-                issues=[ReviewIssue(severity="critical", content="Missing step")],
-            )
-        ]
-
-        verdicts_json = json.dumps([{
-            "reviewer": "Reviewer-A",
-            "issue_index": 0,
-            "verdict": "accept",
-            "reason": "Fixed in v2",
-        }])
-
-        async def mock_safe_call_full(agent, prompt):
-            return MockRunOutput(
-                content="I've evaluated all feedback.",
-                tools=[MockToolExecution(
-                    tool_name="submit_verdict",
-                    tool_args={"verdicts": verdicts_json},
-                )],
-            )
-
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            verdicts = await engine._author_evaluate_feedback("Content v1", feedbacks)
-
-        assert len(verdicts) == 1
-        assert verdicts[0].verdict == "accept"
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
-    @pytest.mark.asyncio
-    async def test_author_uses_submit_revision_tool(self, MockAgent, MockCtxMgr, mock_import):
-        from review_loop.engine import ReviewEngine
-        from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
-
-        config = _make_config(num_reviewers=1)
-        engine = ReviewEngine(config)
-
-        feedbacks = [
-            ReviewerFeedback(
-                reviewer_name="Reviewer-A",
-                issues=[ReviewIssue(severity="critical", content="Missing step")],
-            )
-        ]
-        verdicts = [
-            AuthorVerdictItem(
-                reviewer="Reviewer-A", issue_index=0,
-                verdict="accept", reason="Fixed in v2",
-            )
-        ]
-
-        async def mock_safe_call_full(agent, prompt):
-            return MockRunOutput(
-                content="I've applied all changes.",
-                tools=[MockToolExecution(
-                    tool_name="submit_revision",
-                    tool_args={
-                        "updated_content": "Content v2 with fix applied " * 10,
-                    },
-                )],
-            )
-
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            updated = await engine._author_apply_changes("Content v1", verdicts, feedbacks)
-
-        assert "Content v2 with fix applied" in updated
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
-    @pytest.mark.asyncio
-    async def test_author_evaluate_fallback_to_json_parsing(self, MockAgent, MockCtxMgr, mock_import):
-        """When no submit_verdict tool call, fall back to JSON parsing."""
-        from review_loop.engine import ReviewEngine
-        from review_loop.models import ReviewerFeedback, ReviewIssue
-
-        config = _make_config(num_reviewers=1)
-        engine = ReviewEngine(config)
-
-        feedbacks = [
-            ReviewerFeedback(
-                reviewer_name="Reviewer-A",
-                issues=[ReviewIssue(severity="minor", content="Typo")],
-            )
-        ]
-
-        verdict_json = json.dumps([{"reviewer": "Reviewer-A", "issue_index": 0,
-                                    "verdict": "accept", "reason": "Fixed"}])
-
-        async def mock_safe_call_full(agent, prompt):
-            return MockRunOutput(content=verdict_json)  # No tool calls
-
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            verdicts = await engine._author_evaluate_feedback("Content v1", feedbacks)
-
-        assert len(verdicts) == 1
-        assert verdicts[0].verdict == "accept"
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
-    @pytest.mark.asyncio
-    async def test_author_evaluate_prompt_includes_submit_verdict_instruction(self, MockAgent, MockCtxMgr, mock_import):
-        """The Author evaluate prompt should include submit_verdict instruction."""
-        from review_loop.engine import ReviewEngine
-        from review_loop.models import ReviewerFeedback, ReviewIssue
-
-        config = _make_config(num_reviewers=1)
-        engine = ReviewEngine(config)
-
-        feedbacks = [
-            ReviewerFeedback(
-                reviewer_name="Reviewer-A",
-                issues=[ReviewIssue(severity="minor", content="Typo")],
-            )
-        ]
-
-        captured_prompts = []
-
-        async def mock_safe_call_full(agent, prompt):
-            captured_prompts.append(prompt)
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_verdict",
-                    tool_args={"verdicts": "[]"},
-                )],
-            )
-
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            await engine._author_evaluate_feedback("v1", feedbacks)
-
-        assert len(captured_prompts) == 1
-        assert "submit_verdict" in captured_prompts[0]
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
-    @pytest.mark.asyncio
-    async def test_author_apply_prompt_includes_submit_revision_instruction(self, MockAgent, MockCtxMgr, mock_import):
-        """The Author apply prompt should include submit_revision instruction."""
-        from review_loop.engine import ReviewEngine
-        from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
-
-        config = _make_config(num_reviewers=1)
-        engine = ReviewEngine(config)
-
-        feedbacks = [
-            ReviewerFeedback(
-                reviewer_name="Reviewer-A",
-                issues=[ReviewIssue(severity="minor", content="Typo")],
-            )
-        ]
-        verdicts = [
-            AuthorVerdictItem(
-                reviewer="Reviewer-A", issue_index=0,
-                verdict="accept", reason="Fixed",
-            )
-        ]
-
-        captured_prompts = []
-
-        async def mock_safe_call_full(agent, prompt):
-            captured_prompts.append(prompt)
-            return MockRunOutput(
-                tools=[MockToolExecution(
-                    tool_name="submit_revision",
-                    tool_args={"updated_content": "A" * 200},
-                )],
-            )
-
-        with patch.object(engine, "_safe_agent_call_full", side_effect=mock_safe_call_full):
-            await engine._author_apply_changes("v1", verdicts, feedbacks)
-
-        assert len(captured_prompts) == 1
-        assert "submit_revision" in captured_prompts[0]
 
 
 # ==================================================================
@@ -1808,51 +1047,6 @@ class TestReviewIssueOutputSchema:
         )
         assert issue.why == "Violates evidence principle"
         assert issue.pattern == "Check all statistics for source"
-
-
-class TestWhyPatternInToolExtraction:
-    """Test that why and pattern are preserved through tool call extraction."""
-
-    def test_extract_with_why_pattern(self):
-        from review_loop.engine import ReviewEngine
-
-        issues_json = json.dumps([
-            {
-                "severity": "major",
-                "content": "Missing data",
-                "why": "No source cited",
-                "pattern": "Check all data claims",
-            }
-        ])
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_review",
-                tool_args={"issues": issues_json},
-            )],
-        )
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0]["why"] == "No source cited"
-        assert result[0]["pattern"] == "Check all data claims"
-
-    def test_extract_without_why_pattern_defaults_to_empty(self):
-        """Backward compat: old-style issues without why/pattern."""
-        from review_loop.engine import ReviewEngine
-
-        issues_json = json.dumps([
-            {"severity": "minor", "content": "Typo"}
-        ])
-        run_output = MockRunOutput(
-            tools=[MockToolExecution(
-                tool_name="submit_review",
-                tool_args={"issues": issues_json},
-            )],
-        )
-        result = ReviewEngine._extract_tool_call_issues(run_output)
-        assert result is not None
-        assert "why" not in result[0]  # raw dict doesn't have it
-        # But when constructed into ReviewIssue, defaults kick in
 
 
 class TestWhyPatternSerialization:
@@ -2054,9 +1248,7 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_file_tools_injected_into_agents(self, MockAgent, MockCtxMgr, mock_import):
         """FileTools should be injected into all agents when workspace_dir is set."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config(num_reviewers=2)
 
@@ -2065,12 +1257,8 @@ class TestFileBasedWorkspace:
             workspace.mkdir()
             engine = ReviewEngine(config, workspace_dir=workspace)
 
-            # Tools list should be a mock (from MockAgent) but _setup_file_tools
-            # hasn't been called yet since workspace_dir is set at init but
-            # _setup_file_tools is called in run(). Let's call it directly.
             engine._workspace_dir = workspace
             engine._file_tools_injected = False
-            # The agents are mocks, so tools is a MagicMock. We need real lists.
             engine._author_verdict = MagicMock()
             engine._author_verdict.tools = []
             engine._author_revision = MagicMock()
@@ -2091,9 +1279,7 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_setup_file_tools_idempotent(self, MockAgent, MockCtxMgr, mock_import):
         """Calling _setup_file_tools twice should only inject once."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config(num_reviewers=1)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2118,9 +1304,7 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_read_draft_from_workspace(self, MockAgent, MockCtxMgr, mock_import):
         """_read_draft_from_workspace should read draft.md from workspace."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2140,9 +1324,7 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_write_draft_to_workspace(self, MockAgent, MockCtxMgr, mock_import):
         """_write_draft_to_workspace should write draft.md."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2158,9 +1340,7 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_author_generate_reads_draft_from_file(self, MockAgent, MockCtxMgr, mock_import):
         """_author_generate should prefer draft.md written by agent over text content."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2190,9 +1370,7 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_author_generate_fallback_to_text(self, MockAgent, MockCtxMgr, mock_import):
         """_author_generate should fallback to text when no draft.md is written."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2221,10 +1399,8 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.Agent")
     def test_author_apply_changes_reads_draft_from_file(self, MockAgent, MockCtxMgr, mock_import):
         """_author_apply_changes should prefer draft.md written via FileTools."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
         from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
-        import tempfile
 
         config = _make_config()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2235,7 +1411,7 @@ class TestFileBasedWorkspace:
             new_draft = "C" * 600
             async def fake_arun(**kwargs):
                 (workspace / "draft.md").write_text(new_draft)
-                return MockRunOutput(content="done", tools=[])
+                return MockRunOutput(content="done")
 
             engine._author_revision = MagicMock()
             engine._author_revision.arun = fake_arun
@@ -2258,57 +1434,9 @@ class TestFileBasedWorkspace:
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def test_author_apply_changes_fallback_submit_revision(self, MockAgent, MockCtxMgr, mock_import):
-        """_author_apply_changes falls back to submit_revision when no draft.md."""
-        from pathlib import Path
-        from review_loop.engine import ReviewEngine
-        from review_loop.models import AuthorVerdictItem, ReviewerFeedback, ReviewIssue
-        import tempfile
-
-        config = _make_config()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Path(tmpdir) / "workspace"
-            workspace.mkdir()
-            engine = ReviewEngine(config, workspace_dir=workspace)
-
-            revised = "D" * 200
-            async def fake_arun(**kwargs):
-                return MockRunOutput(
-                    content=None,
-                    tools=[MockToolExecution(
-                        "submit_revision",
-                        {"updated_content": revised},
-                    )],
-                )
-
-            engine._author_revision = MagicMock()
-            engine._author_revision.arun = fake_arun
-            engine._author_revision.name = "Author"
-
-            feedbacks = [ReviewerFeedback(
-                reviewer_name="R",
-                issues=[ReviewIssue(severity="minor", content="fix")]
-            )]
-            verdicts = [AuthorVerdictItem(
-                reviewer="R", issue_index=0, verdict="accept", reason="ok"
-            )]
-
-            import asyncio
-            result = asyncio.get_event_loop().run_until_complete(
-                engine._author_apply_changes("old content", verdicts, feedbacks)
-            )
-            assert result == revised
-            # Should also be written to workspace
-            assert (workspace / "draft.md").read_text() == revised
-
-    @patch("review_loop.engine.import_from_path")
-    @patch("review_loop.engine.ContextManager")
-    @patch("review_loop.engine.Agent")
     def test_review_prompt_uses_file_based_instructions(self, MockAgent, MockCtxMgr, mock_import):
         """Reviewer prompts should instruct to use read_file('draft.md')."""
-        from pathlib import Path
         from review_loop.engine import ReviewEngine
-        import tempfile
 
         config = _make_config(num_reviewers=1)
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2320,20 +1448,18 @@ class TestFileBasedWorkspace:
 
             # Capture the prompt passed to reviewer
             captured_prompt = None
-            async def fake_arun(**kwargs):
+            async def mock_safe_call(agent, prompt):
                 nonlocal captured_prompt
-                captured_prompt = kwargs.get("input", "")
-                return MockRunOutput(
-                    content=None,
-                    tools=[MockToolExecution(
-                        "submit_review",
-                        {"issues": "[]"},
-                    )],
+                captured_prompt = prompt
+                (workspace / "feedback_R1_Reviewer-A.md").write_text(
+                    "## No Issues\n审核通过。\n"
                 )
+                return "done"
+
+            engine._safe_agent_call = mock_safe_call
 
             reviewer = MagicMock()
             reviewer.name = "Reviewer-A"
-            reviewer.arun = fake_arun
             engine._reviewers = [reviewer]
 
             import asyncio
@@ -2378,10 +1504,10 @@ class TestErrorCallback:
 
         engine._author_generate = AsyncMock(return_value="v1")
 
-        async def mock_safe_call_full(agent, prompt):
+        async def mock_safe_call(agent, prompt):
             return None
 
-        engine._safe_agent_call_full = AsyncMock(side_effect=mock_safe_call_full)
+        engine._safe_agent_call = AsyncMock(side_effect=mock_safe_call)
         # Need real reviewers list for _review to iterate
         r1 = MagicMock()
         r1.name = "Reviewer-A"
@@ -2405,7 +1531,7 @@ class TestErrorCallback:
 
         engine._author_generate = AsyncMock(return_value="v1")
 
-        engine._safe_agent_call_full = AsyncMock(return_value=None)
+        engine._safe_agent_call = AsyncMock(return_value=None)
         r1 = MagicMock()
         r1.name = "Reviewer-A"
         engine._reviewers = [r1]
@@ -2427,7 +1553,7 @@ class TestErrorCallback:
         engine = self._setup_engine(config, error_callback=bad_callback)
 
         engine._author_generate = AsyncMock(return_value="v1")
-        engine._safe_agent_call_full = AsyncMock(return_value=None)
+        engine._safe_agent_call = AsyncMock(return_value=None)
         r1 = MagicMock()
         r1.name = "Reviewer-A"
         engine._reviewers = [r1]

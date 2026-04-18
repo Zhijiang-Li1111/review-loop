@@ -12,6 +12,7 @@ from review_loop.config import (
     resolve_env,
 )
 from review_loop.engine import ReviewEngine
+from review_loop.file_protocol import parse_feedback_file, parse_verdict_file
 from review_loop.models import (
     AuthorResponse,
     AuthorVerdictItem,
@@ -21,7 +22,6 @@ from review_loop.models import (
     RoundRecord,
 )
 from review_loop.registry import import_from_path
-from review_loop.tools import submit_review, submit_revision, submit_verdict
 
 __all__ = [
     "AuthorConfig",
@@ -40,8 +40,7 @@ __all__ = [
     "build_claude",
     "generate_usage_summary",
     "import_from_path",
+    "parse_feedback_file",
+    "parse_verdict_file",
     "resolve_env",
-    "submit_review",
-    "submit_revision",
-    "submit_verdict",
 ]

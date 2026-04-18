@@ -513,30 +513,36 @@ class TestGuidancePromptInjection:
     @patch("review_loop.engine.import_from_path")
     @patch("review_loop.engine.ContextManager")
     @patch("review_loop.engine.Agent")
-    def _setup_engine(self, config, MockAgent, MockCtxMgr, mock_import):
+    def _setup_engine(self, config, MockAgent, MockCtxMgr, mock_import, workspace_dir=None):
         from review_loop.engine import ReviewEngine
 
-        engine = ReviewEngine(config)
+        engine = ReviewEngine(config, workspace_dir=workspace_dir)
+        # Set up named mock reviewer
+        mock_reviewer = MagicMock()
+        mock_reviewer.name = "Reviewer-A"
+        mock_reviewer.tools = []
+        engine._reviewers = [mock_reviewer]
         return engine
 
     @pytest.mark.asyncio
-    async def test_reviewer_prompt_contains_guidance(self):
+    async def test_reviewer_prompt_contains_guidance(self, tmp_path):
         """The actual reviewer prompt should contain the guidance prefix."""
         config = _make_config(max_rounds=1, num_reviewers=1)
-        engine = self._setup_engine(config)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "draft.md").write_text("test content")
+        engine = self._setup_engine(config, workspace_dir=workspace)
 
         captured_prompts = []
 
         async def mock_agent_call(agent, prompt):
             captured_prompts.append(prompt)
-            # Return a simple mock RunOutput
-            mock_output = MagicMock()
-            mock_output.tools = []
-            mock_output.messages = []
-            mock_output.content = '{"issues": []}'
-            return mock_output
+            # Write feedback file (no issues)
+            fb = workspace / f"feedback_R0_{agent.name}.md"
+            fb.write_text("## No Issues\n审核通过。\n")
+            return '{"issues": []}'
 
-        engine._safe_agent_call_full = AsyncMock(side_effect=mock_agent_call)
+        engine._safe_agent_call = AsyncMock(side_effect=mock_agent_call)
 
         await engine._review("test content", {}, guidance="Use DeepSeek V4")
 
@@ -544,21 +550,22 @@ class TestGuidancePromptInjection:
         assert "📋 主编指导意见（供审核参考）：Use DeepSeek V4" in captured_prompts[0]
 
     @pytest.mark.asyncio
-    async def test_reviewer_prompt_no_guidance_when_none(self):
+    async def test_reviewer_prompt_no_guidance_when_none(self, tmp_path):
         config = _make_config(max_rounds=1, num_reviewers=1)
-        engine = self._setup_engine(config)
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        (workspace / "draft.md").write_text("test content")
+        engine = self._setup_engine(config, workspace_dir=workspace)
 
         captured_prompts = []
 
         async def mock_agent_call(agent, prompt):
             captured_prompts.append(prompt)
-            mock_output = MagicMock()
-            mock_output.tools = []
-            mock_output.messages = []
-            mock_output.content = '{"issues": []}'
-            return mock_output
+            fb = workspace / f"feedback_R0_{agent.name}.md"
+            fb.write_text("## No Issues\n审核通过。\n")
+            return '{"issues": []}'
 
-        engine._safe_agent_call_full = AsyncMock(side_effect=mock_agent_call)
+        engine._safe_agent_call = AsyncMock(side_effect=mock_agent_call)
 
         await engine._review("test content", {})
 
@@ -574,13 +581,9 @@ class TestGuidancePromptInjection:
 
         async def mock_agent_call(agent, prompt):
             captured_prompts.append(prompt)
-            mock_output = MagicMock()
-            mock_output.tools = []
-            mock_output.messages = []
-            mock_output.content = "[]"
-            return mock_output
+            return "[]"
 
-        engine._safe_agent_call_full = AsyncMock(side_effect=mock_agent_call)
+        engine._safe_agent_call = AsyncMock(side_effect=mock_agent_call)
 
         feedbacks = [
             ReviewerFeedback(
@@ -604,13 +607,9 @@ class TestGuidancePromptInjection:
 
         async def mock_agent_call(agent, prompt):
             captured_prompts.append(prompt)
-            mock_output = MagicMock()
-            mock_output.tools = []
-            mock_output.messages = []
-            mock_output.content = "[]"
-            return mock_output
+            return "[]"
 
-        engine._safe_agent_call_full = AsyncMock(side_effect=mock_agent_call)
+        engine._safe_agent_call = AsyncMock(side_effect=mock_agent_call)
 
         feedbacks = [
             ReviewerFeedback(
