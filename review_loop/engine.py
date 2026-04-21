@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import os
@@ -48,6 +49,66 @@ class ReviewerOutput(BaseModel):
     issues: list[ReviewIssueOutput] = Field(default_factory=list, description="List of issues found. Empty list means no issues.")
 
 logger = logging.getLogger(__name__)
+
+# OOM protection thresholds (bytes)
+_OOM_WARN_BYTES = 6 * 1024 * 1024 * 1024   # 6 GB — warn + gc.collect()
+_OOM_ABORT_BYTES = 8 * 1024 * 1024 * 1024   # 8 GB — graceful exit
+
+
+def _get_rss_mb() -> float:
+    """Return current process RSS in megabytes (current, not peak)."""
+    rss_bytes = _get_rss_bytes()
+    return rss_bytes / (1024 * 1024) if rss_bytes else 0.0
+
+
+def _get_rss_bytes() -> int:
+    """Return current RSS in bytes (from /proc/self/statm, Linux only)."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[1])  # resident pages
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _check_memory() -> bool:
+    """Check RSS and take action if too high. Returns False if must abort."""
+    rss = _get_rss_bytes()
+    if rss >= _OOM_ABORT_BYTES:
+        logger.critical(
+            "RSS %.1f GB exceeds abort threshold (8 GB) — aborting",
+            rss / (1024 ** 3),
+        )
+        return False
+    if rss >= _OOM_WARN_BYTES:
+        logger.warning(
+            "RSS %.1f GB exceeds warning threshold (6 GB) — running gc.collect()",
+            rss / (1024 ** 3),
+        )
+        gc.collect()
+    return True
+
+
+def _write_heartbeat(
+    session_dir: Path | str,
+    round_num: int,
+    status: str = "running",
+    phase: str = "",
+) -> None:
+    """Write a heartbeat JSON file to the session directory."""
+    hb = {
+        "round": round_num,
+        "rss_mb": round(_get_rss_mb(), 1),
+        "rss_bytes": _get_rss_bytes(),
+        "timestamp": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "status": status,
+        "phase": phase,
+    }
+    path = Path(session_dir) / "heartbeat.json"
+    try:
+        path.write_text(json.dumps(hb, indent=2))
+    except OSError:
+        logger.warning("Failed to write heartbeat to %s", path)
 
 
 def _build_skills(
@@ -856,6 +917,27 @@ class ReviewEngine:
 
         try:
             for round_num in range(start_round, max_rounds + 1):
+                round_start = _time.monotonic()
+                logger.info(
+                    "=== Round %d start | RSS=%.1f MB ===",
+                    round_num, _get_rss_mb(),
+                )
+
+                # OOM protection: check before each round
+                if not _check_memory():
+                    _write_heartbeat(session_path, round_num, status="oom_abort", phase="pre_review")
+                    self._archiver.save_final(content)
+                    return ReviewResult(
+                        converged=False,
+                        rounds_completed=rounds_completed,
+                        archive_path=session_path,
+                        final_content=content,
+                        unresolved_issues=[],
+                        terminated_by_error=True,
+                    )
+
+                _write_heartbeat(session_path, round_num, status="running", phase="review")
+
                 # Reviewers audit in parallel
                 feedbacks = await self._review(content, per_reviewer_ctx, guidance=guidance, round_num=round_num)
 
@@ -869,6 +951,7 @@ class ReviewEngine:
                 total_issues = sum(len(fb.issues) for fb in feedbacks)
                 if total_issues == 0:
                     self._archiver.save_final(content)
+                    _write_heartbeat(session_path, round_num, status="converged", phase="done")
                     return ReviewResult(
                         converged=True,
                         rounds_completed=round_num,
@@ -878,6 +961,7 @@ class ReviewEngine:
                     )
 
                 # Author evaluates feedback (verdict only)
+                _write_heartbeat(session_path, round_num, status="running", phase="verdict")
                 verdicts = await self._author_evaluate_feedback(content, feedbacks, guidance=guidance, round_num=round_num)
 
                 self._archiver.save_author_verdict(
@@ -886,6 +970,7 @@ class ReviewEngine:
                 )
 
                 # Author applies changes (revision only)
+                _write_heartbeat(session_path, round_num, status="running", phase="revision")
                 updated_content = await self._author_apply_changes(content, verdicts, feedbacks, round_num=round_num)
 
                 self._archiver.save_author_response(
@@ -903,6 +988,13 @@ class ReviewEngine:
                 # Build per-reviewer context for next round
                 per_reviewer_ctx = self._build_reviewer_context(feedbacks, verdicts)
 
+                elapsed = _time.monotonic() - round_start
+                logger.info(
+                    "=== Round %d done | %.1fs | RSS=%.1f MB | issues=%d ===",
+                    round_num, elapsed, _get_rss_mb(), total_issues,
+                )
+                _write_heartbeat(session_path, round_num, status="running", phase="round_done")
+
             # Max rounds reached
             # Collect last round's unresolved issues
             last_feedbacks = feedbacks if feedbacks else []
@@ -912,6 +1004,7 @@ class ReviewEngine:
             self._archiver.save_unresolved(
                 [asdict(fb) for fb in unresolved]
             )
+            _write_heartbeat(session_path, max_rounds, status="max_rounds", phase="done")
 
             return ReviewResult(
                 converged=False,
@@ -923,13 +1016,29 @@ class ReviewEngine:
 
         except RuntimeError as exc:
             # error_callback already invoked by _handle_runtime_error if applicable
+            logger.error("RuntimeError in review loop: %s", exc)
             if self._archiver._session_dir is not None:
                 self._archiver.save_error_log(str(exc))
+            _write_heartbeat(session_path, rounds_completed, status="error", phase="runtime_error")
             return ReviewResult(
                 converged=False,
                 rounds_completed=rounds_completed,
                 archive_path=session_path,
                 final_content=None,
+                unresolved_issues=[],
+                terminated_by_error=True,
+            )
+
+        except Exception as exc:
+            logger.critical("Unexpected exception in review loop", exc_info=True)
+            if self._archiver._session_dir is not None:
+                self._archiver.save_error_log(f"Unexpected: {exc}")
+            _write_heartbeat(session_path, rounds_completed, status="error", phase="unexpected_exception")
+            return ReviewResult(
+                converged=False,
+                rounds_completed=rounds_completed,
+                archive_path=session_path,
+                final_content=content,
                 unresolved_issues=[],
                 terminated_by_error=True,
             )

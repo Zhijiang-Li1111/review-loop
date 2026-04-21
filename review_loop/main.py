@@ -4,11 +4,46 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
+import signal
 import sys
 
 from review_loop.config import ConfigLoader
 from review_loop.engine import ReviewEngine
+
+logger = logging.getLogger("review_loop")
+
+
+def _setup_logging(session_dir: str | None = None) -> None:
+    """Configure logging to stderr + optional file."""
+    fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+    root = logging.getLogger()
+
+    if not root.handlers:
+        # First call: set up stderr handler
+        root.setLevel(logging.INFO)
+        formatter = logging.Formatter(fmt)
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(formatter)
+        root.addHandler(stderr_handler)
+
+    if session_dir:
+        log_path = os.path.join(session_dir, "run.log")
+        os.makedirs(session_dir, exist_ok=True)
+        formatter = logging.Formatter(fmt)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        root.addHandler(file_handler)
+
+
+def _install_signal_handlers() -> None:
+    """Log a message on SIGTERM before exiting."""
+    def _on_sigterm(signum, frame):
+        logger.critical("Received SIGTERM (signal %d) — exiting", signum)
+        sys.exit(143)  # 128 + 15
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
 
 
 def main() -> None:
@@ -45,6 +80,10 @@ def main() -> None:
         print("Error: --rounds can only be used with --resume", file=sys.stderr)
         sys.exit(1)
 
+    # Set up logging early (stderr only until we know the session dir)
+    _setup_logging()
+    _install_signal_handlers()
+
     config = ConfigLoader.load(args.config)
     engine = ReviewEngine(config)
 
@@ -65,8 +104,23 @@ def main() -> None:
     if args.guidance:
         run_kwargs["guidance"] = args.guidance
 
-    result = asyncio.run(engine.run(**run_kwargs))
+    try:
+        result = asyncio.run(engine.run(**run_kwargs))
+    except MemoryError:
+        logger.critical("MemoryError — process running out of memory")
+        sys.exit(137)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user (SIGINT)")
+        sys.exit(130)
+    except Exception:
+        logger.critical("Unhandled exception in review loop", exc_info=True)
+        sys.exit(1)
 
+    # Reconfigure logging to also write to session log file
+    if result.archive_path:
+        _setup_logging(result.archive_path)
+
+    logger.info("Review archived at: %s", result.archive_path)
     print(f"Review archived at: {result.archive_path}")
     if result.converged:
         print(f"Status: converged in {result.rounds_completed} round(s)")
